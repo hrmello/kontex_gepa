@@ -11,6 +11,8 @@ from deepeval.metrics import GEval
 from deepeval.test_case import LLMTestCaseParams, LLMTestCase
 from langchain_openai import AzureChatOpenAI
 from deepeval.models.base_model import DeepEvalBaseLLM
+from deepeval.metrics import BaseMetric, GEval
+from deepeval.metrics.g_eval import Rubric
 
 # Add parent directory to path for importing gepa and kontex
 current_dir = Path(__file__).parent
@@ -41,7 +43,7 @@ from kontex.settings import settings
 
 from gepa import GEPAOptimizer, GEPAConfig
 from gepa.core.system import CompoundAISystem, LanguageModule, SequentialFlow, IOSchema
-from gepa.evaluation.base import SimpleEvaluator
+from gepa.evaluation.base import SimpleEvaluator, SimpleFeedbackEvaluator
 from gepa.evaluation.metrics import ExactMatch, F1Score
 from gepa.inference.factory import InferenceFactory
 from gepa.config import InferenceConfig, OptimizationConfig, DatabaseConfig, ObservabilityConfig
@@ -105,6 +107,9 @@ class EnvConfig:
         self.api_key = os.getenv("OPENAI_API_KEY")
         self.base_url = os.getenv("OPENAI_API_BASE")
         self.model = os.getenv("OPENAI_MODEL")
+        self.azure_endpoint = os.getenv("AZURE_ENDPOINT")
+        self.openai_api_version = os.getenv("OPENAI_API_VERSION")
+        self.azure_deployment = os.getenv("AZURE_DEPLOYMENT")
 
 class AzureOpenAI(DeepEvalBaseLLM):
     def __init__(
@@ -201,7 +206,6 @@ class AverageDiffScore(Metric):
     def __init__(self, name: str = "score"):
         super().__init__(name)
        
-    
     def compute(self, predictions: List[Any], references: List[Any]) -> float:
         """Compute exact match score."""
         
@@ -230,7 +234,7 @@ class GEvalMetric(Metric):
         # Check for API key
         self.api_key = config.api_key
         self.model = config.model
-        azure_endpoint = "https://azureopenai4k.openai.azure.com/"
+        azure_endpoint = config.azure_endpoint
         openai_api_version = "2025-01-01-preview"
         azure_deployment = "gpt-5-mini"
 
@@ -255,9 +259,19 @@ class GEvalMetric(Metric):
             name="Factual Accuracy",
             model = self.azure_openai,
             criteria="Evaluate whether the actual output contains any made-up, incorrect, or fabricated facts when compared to the expected output. Penalize heavily for invented information.",
+            #TODO Testar evaluation_steps
+            # avalie se tem alucinação. Caso tenha, não dê score maior que X
+            rubric = [
+                Rubric(score_range=(0,4), expected_outcome="Mostly made-up or incorrect content."),
+                Rubric(score_range=(5,7), expected_outcome=f"Half correct, a considerable amount of made-up content. Around 30-50% of the content is fabricated."),
+                Rubric(score_range=(8,9), expected_outcome="Mostly correct with few fabricated content (less than 20%)."),
+                Rubric(score_range=(10,10), expected_outcome=f"100% correct."),
+            ],
             evaluation_params=[LLMTestCaseParams.ACTUAL_OUTPUT, LLMTestCaseParams.EXPECTED_OUTPUT],
             threshold=0.7
         )
+
+        #TODO Usar métricas "fixas" da literatura: BERTScore, BLEU, ROUGE, etc
 
         completeness = GEval(
             name="Completeness",
@@ -274,12 +288,79 @@ class GEvalMetric(Metric):
             retrieval_context=[reference_description] 
         )
 
-        factual_accuracy_score = factual_accuracy.measure(test_case)
-        completeness_score = completeness.measure(test_case)
-        overall_score = (weight_hallucination*factual_accuracy_score + weight_completeness*completeness_score)
+        
+        factual_accuracy_scores, factual_accuracy_reason = self.convergence_geval_loop(factual_accuracy, test_case, n_runs = 20, max_retries = 3, min_std_error=0.05, n_runs_min=5)
+        completeness_scores, completeness_reason = self.convergence_geval_loop(completeness, test_case, n_runs = 20, max_retries = 3, min_std_error=0.05, n_runs_min=5)
 
-        return overall_score
+        # TODO Usar uma LLM aberta pra pegar as probabilidades (subir no nebius/GCP)
+        computed_statistics_factual = self.compute_statistics(factual_accuracy_scores)
+        computed_statistics_completeness = self.compute_statistics(completeness_scores)
 
+        overall_score = (weight_hallucination*computed_statistics_factual["mean"] + weight_completeness*computed_statistics_completeness["mean"])
+        # completeness_score = completeness.measure(test_case)
+        # overall_score = (weight_hallucination*factual_accuracy_score + weight_completeness*completeness_score)
+
+        aggregated_reasoning = self.aggregate_reasons([factual_accuracy_reason, completeness_reason])
+
+        return overall_score, aggregated_reasoning
+    
+    def aggregate_reasons(self, reasons: List[str]) -> str:
+
+        prompt_aggregation = f"""
+        You are an expert AI assistant specialized in summarizing evaluation feedback.
+        Given multiple reasoning statements from different evaluation runs, your task is to aggregate them into a single coherent reasoning that captures the key points.  The aggregated reasoning must be as general as possible, rather than using specific names or methods.
+        
+        Here is a list of reasons for different evaluation metrics:
+        {reasons}"""
+
+        reasoning_aggregation = self.azure_openai.generate(prompt_aggregation)
+
+        return reasoning_aggregation
+
+    
+    def compute_statistics(self, scores: List[float]) -> Dict[str, float]:
+        """Compute mean and standard deviation of scores."""
+        mean_score = np.mean(np.array(scores))
+        std_deviation = np.std(np.array(scores))
+
+        return {
+            "mean": mean_score,
+            "std_deviation": std_deviation,
+            "std_error": std_deviation / np.sqrt(len(scores))
+        }
+    
+    def convergence_geval_loop(self, metric: BaseMetric, test_case: LLMTestCase, n_runs: int = 10, max_retries: int = 3, n_runs_min: int = 10, min_std_error: float = 0.05):
+
+        retries = 0
+        sucessful_runs = 0
+        scores = list()
+        reasoning = list()
+        n = 0
+        
+        while retries < max_retries and sucessful_runs < n_runs:
+            try:
+                print(f"{metric.name} run {n}")
+                score = metric.measure(test_case)
+                scores.append(score)
+                print(f"{metric.name}:", score)
+                sucessful_runs += 1
+                n += 1
+
+                partial_std_deviation = np.std(scores)
+                partial_std_error = partial_std_deviation / np.sqrt(len(scores))
+                
+                reasoning.append(metric.reason)
+                print(f"Standard Error in run {n}: {partial_std_error}")
+                
+                if n >= n_runs_min and partial_std_error < min_std_error: # Confidence Interval = 0.95 if min_std_error = 0.05
+                    print(f"{metric.name} converged after {n} runs.")
+                    return scores, reasoning
+                
+            except Exception as e:
+                print(f"Error during {metric.name} evaluation: {e}. Retrying...")
+                retries += 1
+                continue
+        
 class LLMJudgeMetric(Metric):
     """LLM Judge Metric."""
     
@@ -363,7 +444,7 @@ def generate_pareto_dataset(seed = 42):
                 forgetting_chance=0.7,
                 n_patients_zero=1,
                 connections=1.5,
-                table_info=[(theme, 3, 0.8)],
+                table_info=[(theme, 1, 0.8)], #(theme, 3, 0.8)
             )
 
         run, simulated_users, full_knowledge = edd_simulation(config, seed)
@@ -508,8 +589,9 @@ async def main():
     )
 
     # 4. Create evaluator (need to change metrics for Kontex)
-    evaluator = SimpleEvaluator([
-        AverageDiffScore(name="average_score")
+    evaluator = SimpleFeedbackEvaluator([
+        # AverageDiffScore(name="average_score")
+        GEvalMetric(name="geval_metric")
     ])
     
     # 5. Create inference client
