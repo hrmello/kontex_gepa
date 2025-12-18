@@ -56,6 +56,7 @@ def run_conversation_simulation(
     simulated_users: dict[str, Specialist],
     full_knowledge: FullKnowledge,
     seed: int = None,
+    min_description_quality: int = 9,
 ) -> dict[str, str]:
     rng = random.Random(seed)
 
@@ -77,7 +78,7 @@ def run_conversation_simulation(
         description, final_critique_score = conversational_wrapper.run_conversation(
             table,
             initial_user,
-            min_description_quality=9,
+            min_description_quality=min_description_quality,
             max_conversation_depth = 15 # Limit the conversation depth to avoid long runtimes during testing
         )
 
@@ -138,6 +139,9 @@ class AzureOpenAI(DeepEvalBaseLLM):
 class KontexFlow:
     """A placeholder for KontexFlow control flow logic."""
     
+    def __init__(self, min_description_quality: int = 8):
+        self.min_description_quality = min_description_quality
+        
     async def execute(
         self,
         modules: Dict[str, LanguageModule],
@@ -182,8 +186,8 @@ class KontexFlow:
             simulated_users=input_data["users_with_knowledge"],
             full_knowledge=input_data["full_knowledge"],
             seed=42,
+            min_description_quality=self.min_description_quality,
         )
-        logger.debug("Final critique score: {final_critique_score}")
 
         # Ensure we return a numeric value
         if final_critique_score is None:
@@ -197,6 +201,7 @@ class KontexFlow:
 
         # current_data['description'] = description
         current_data['output'] = final_critique_score
+        current_data['predicted_description'] = description
         logger.debug(f"Final critic score: {current_data['output']}")
         return current_data
     
@@ -248,61 +253,74 @@ class GEvalMetric(Metric):
         )
 
         self.azure_openai = AzureOpenAI(model=custom_model)
-    def compute(self, prediction_description: str, reference_description: str) -> float:
+
+    def compute(self, predictions: list, references: list):
         """
         Compute several criteria scores between prediction and reference descriptions.
         """
         weight_hallucination = 0.6
         weight_completeness = 0.4
 
-        factual_accuracy = GEval(
-            name="Factual Accuracy",
-            model = self.azure_openai,
-            criteria="Evaluate whether the actual output contains any made-up, incorrect, or fabricated facts when compared to the expected output. Penalize heavily for invented information.",
-            #TODO Testar evaluation_steps
-            # avalie se tem alucinação. Caso tenha, não dê score maior que X
-            rubric = [
-                Rubric(score_range=(0,4), expected_outcome="Mostly made-up or incorrect content."),
-                Rubric(score_range=(5,7), expected_outcome=f"Half correct, a considerable amount of made-up content. Around 30-50% of the content is fabricated."),
-                Rubric(score_range=(8,9), expected_outcome="Mostly correct with few fabricated content (less than 20%)."),
-                Rubric(score_range=(10,10), expected_outcome=f"100% correct."),
-            ],
-            evaluation_params=[LLMTestCaseParams.ACTUAL_OUTPUT, LLMTestCaseParams.EXPECTED_OUTPUT],
-            threshold=0.7
-        )
+        for pred, ref in zip(predictions, references):
+            # print("Ref", ref)
+            # print("Predictions:", pred.keys())
+            prediction_description = pred["predicted_description"]
+            assert len(list(prediction_description.keys())) == 1, "Currently only single table descriptions are supported."
+            prediction_description = prediction_description[list(prediction_description.keys())[0]]
 
-        #TODO Usar métricas "fixas" da literatura: BERTScore, BLEU, ROUGE, etc
+            expected_description = ref["expected_description"]
 
-        completeness = GEval(
-            name="Completeness",
-            model = self.azure_openai,
-            criteria="Evaluate how much of the key information from the expected output is covered in the actual output. Check for missing variables, descriptions, or important details.",
-            evaluation_params=[LLMTestCaseParams.ACTUAL_OUTPUT, LLMTestCaseParams.EXPECTED_OUTPUT],
-            threshold=0.7
-        )
-    
-        test_case = LLMTestCase(
-            input="Provide a comprehensive description of the MineProcessAssays table, including detailed variable descriptions for GRDFe_A, RCV_PCT, and SMP_RUNID with their data types, purposes, expected ranges, common issues, validation rules, and relationships to other tables.",
-            actual_output=prediction_description,
-            expected_output=reference_description,
-            retrieval_context=[reference_description] 
-        )
+            # print("Prediction description:", prediction_description)
+            # print("Expected description:", expected_description)
+            prediction_score = pred["output"]
+            expected_score = ref["expected"]
 
+            factual_accuracy = GEval(
+                name="Factual Accuracy",
+                model = self.azure_openai,
+                criteria="Evaluate whether the actual output contains any made-up, incorrect, or fabricated facts when compared to the expected output. Penalize heavily for invented information.",
+                #TODO Testar evaluation_steps
+                # avalie se tem alucinação. Caso tenha, não dê score maior que X
+                rubric = [
+                    Rubric(score_range=(0,4), expected_outcome="Mostly made-up or incorrect content."),
+                    Rubric(score_range=(5,7), expected_outcome=f"Half correct, a considerable amount of made-up content. Around 30-50% of the content is fabricated."),
+                    Rubric(score_range=(8,9), expected_outcome="Mostly correct with few fabricated content (less than 20%)."),
+                    Rubric(score_range=(10,10), expected_outcome=f"100% correct."),
+                ],
+                evaluation_params=[LLMTestCaseParams.ACTUAL_OUTPUT, LLMTestCaseParams.EXPECTED_OUTPUT],
+                threshold=0.7
+            )
+
+            #TODO Usar métricas "fixas" da literatura: BERTScore, BLEU, ROUGE, etc
+            completeness = GEval(
+                name="Completeness",
+                model = self.azure_openai,
+                criteria="Evaluate how much of the key information from the expected output is covered in the actual output. Check for missing variables, descriptions, or important details.",
+                evaluation_params=[LLMTestCaseParams.ACTUAL_OUTPUT, LLMTestCaseParams.EXPECTED_OUTPUT],
+                threshold=0.7
+            )
         
-        factual_accuracy_scores, factual_accuracy_reason = self.convergence_geval_loop(factual_accuracy, test_case, n_runs = 20, max_retries = 3, min_std_error=0.05, n_runs_min=5)
-        completeness_scores, completeness_reason = self.convergence_geval_loop(completeness, test_case, n_runs = 20, max_retries = 3, min_std_error=0.05, n_runs_min=5)
+            # print("Prediction description:", prediction_description[list(prediction_description.keys())[0]])
+            test_case = LLMTestCase(
+                input="Provide a comprehensive description of a table, including detailed variable descriptions with their data types, purposes, expected ranges, common issues, validation rules, and relationships to other tables.",
+                actual_output=prediction_description,
+                expected_output=expected_description,
+                retrieval_context=[expected_description] 
+            )
 
-        # TODO Usar uma LLM aberta pra pegar as probabilidades (subir no nebius/GCP)
-        computed_statistics_factual = self.compute_statistics(factual_accuracy_scores)
-        computed_statistics_completeness = self.compute_statistics(completeness_scores)
+            
+            factual_accuracy_scores, factual_accuracy_reason = self.convergence_geval_loop(factual_accuracy, test_case, n_runs = 20, max_retries = 3, min_std_error=0.05, n_runs_min=5)
+            completeness_scores, completeness_reason = self.convergence_geval_loop(completeness, test_case, n_runs = 20, max_retries = 3, min_std_error=0.05, n_runs_min=5)
 
-        overall_score = (weight_hallucination*computed_statistics_factual["mean"] + weight_completeness*computed_statistics_completeness["mean"])
-        # completeness_score = completeness.measure(test_case)
-        # overall_score = (weight_hallucination*factual_accuracy_score + weight_completeness*completeness_score)
+            # TODO Usar uma LLM aberta pra pegar as probabilidades (subir no nebius/GCP)
+            computed_statistics_factual = self.compute_statistics(factual_accuracy_scores)
+            computed_statistics_completeness = self.compute_statistics(completeness_scores)
 
-        aggregated_reasoning = self.aggregate_reasons([factual_accuracy_reason, completeness_reason])
+            overall_score = (weight_hallucination*computed_statistics_factual["mean"] + weight_completeness*computed_statistics_completeness["mean"])
 
-        return overall_score, aggregated_reasoning
+            aggregated_reasoning = self.aggregate_reasons([factual_accuracy_reason, completeness_reason])
+
+            return overall_score, aggregated_reasoning
     
     def aggregate_reasons(self, reasons: List[str]) -> str:
 
@@ -360,7 +378,10 @@ class GEvalMetric(Metric):
                 print(f"Error during {metric.name} evaluation: {e}. Retrying...")
                 retries += 1
                 continue
-        
+
+        print(f"{metric.name} did not converge. Returning {len(scores)} scores.")
+        return scores, reasoning
+
 class LLMJudgeMetric(Metric):
     """LLM Judge Metric."""
     
@@ -428,29 +449,39 @@ def compute_similarity(description, datapoint):
 
     return similarity_matrix, score
 
-def generate_pareto_dataset(seed = 42):
+
+
+def generate_pareto_dataset(seed = 42, numbers_of_themes: int = 3, max_hier_depth: int = 2, n_employees: int = 5, n_columns_per_table: int = 3) -> List[Dict[str, Any]]:
     from collections import defaultdict
-    table_themes = ["mining", "healthcare"] #"finance", "technology", "retail"]#, "education"]
+    import random 
+    def join_description_and_facts(description: str, facts: Dict[str, str]) -> str:
+        combined = description.strip() + "\n\nFacts:\n"
+        for key, val in facts.items():
+            combined += f"- {key}: {val.strip()}\n\n"
+        return combined
+
+    all_table_themes = ["mining", "healthcare", "finance", "technology", "retail", "education"]
     
+    table_themes = random.Random(seed).sample(all_table_themes, min(numbers_of_themes, len(all_table_themes)))
+
     dataset = list()
 
     for theme in table_themes:
         config = EDDRunConfig(
-                max_hier_depth=2,
-                n_employees=5,
+                max_hier_depth=max_hier_depth,
+                n_employees=n_employees,
                 mean_degree=math.ceil(5 ** (1 / 2)),
                 alpha=0.1,
                 decay=0.8,
                 forgetting_chance=0.7,
                 n_patients_zero=1,
                 connections=1.5,
-                table_info=[(theme, 1, 0.8)], #(theme, 3, 0.8)
+                table_info=[(theme, n_columns_per_table, 0.8)], #(theme, 3, 0.8)
             )
 
         run, simulated_users, full_knowledge = edd_simulation(config, seed)
     
         domain_name = list(full_knowledge.domains.keys())[0]
-        print("DOMAIN NAME", domain_name)
         domain_description = full_knowledge.domains[domain_name].description
         column_descriptions = full_knowledge.domains[domain_name].facts
 
@@ -460,6 +491,7 @@ def generate_pareto_dataset(seed = 42):
         theme_dict["users_with_knowledge"] = simulated_users
         theme_dict["question"] = f"Describe the dataset related to {theme} operations, including key attributes and their significance."
         theme_dict["expected"] = 10
+        theme_dict["expected_description"] = join_description_and_facts(domain_description, column_descriptions)
 
         logger.debug(f"Table description: {full_knowledge.domains[domain_name].description}")
         logger.debug(f"Column descriptions: {full_knowledge.domains[domain_name].facts}")
@@ -476,13 +508,34 @@ def generate_pareto_dataset(seed = 42):
 
 async def main():
 
-    # 1. Creating Kontex dataset
-    dataset = generate_pareto_dataset()
+    # dataset parameters
+    NUMBER_OF_THEMES = 3
+    MAX_HIER_DEPTH = 3
+    N_EMPLOYEES = 8
+    N_COLUMNS_PER_TABLE = 3
 
-    print(dataset)
-    # dpareto_size = 4
-    # dpareto = dataset[:dpareto_size]
-    # dfeedback = dataset[dpareto_size:]
+    # kontex conversation parameters
+    MIN_DESCRIPTION_QUALITY = 8
+
+    # gepa parameters
+    PARETO_SET_SIZE = 2
+    MINI_BATCH_SIZE = NUMBER_OF_THEMES - PARETO_SET_SIZE
+
+    
+    logger.info(f"Parameters used in this run:")
+    logger.info(f"  NUMBER_OF_THEMES: {NUMBER_OF_THEMES}")
+    logger.info(f"  MAX_HIER_DEPTH: {MAX_HIER_DEPTH}")
+    logger.info(f"  N_EMPLOYEES: {N_EMPLOYEES}")
+    logger.info(f"  N_COLUMNS_PER_TABLE: {N_COLUMNS_PER_TABLE}")
+    logger.info(f"  MIN_DESCRIPTION_QUALITY: {MIN_DESCRIPTION_QUALITY}")
+    logger.info(f"  PARETO_SET_SIZE: {PARETO_SET_SIZE}")
+    logger.info(f"  MINI_BATCH_SIZE: {MINI_BATCH_SIZE}")
+    
+    # 1. Creating Kontex dataset
+    dataset = generate_pareto_dataset(numbers_of_themes=NUMBER_OF_THEMES, 
+                                      max_hier_depth=MAX_HIER_DEPTH, 
+                                      n_employees=N_EMPLOYEES, 
+                                      n_columns_per_table=N_COLUMNS_PER_TABLE)
 
     # 2. System with 2 modules: questioner and critique
     system = CompoundAISystem(
@@ -507,6 +560,8 @@ async def main():
                         - Example values
                         - Business context and relationships
                         
+                        Do not ask the {specialist} to create SQL queries for any reason. Make explicit to {specialist} not to write any SQL queries.
+                         
                         Question:
                         """,
                 model_weights="gpt-5-mini"
@@ -535,7 +590,7 @@ async def main():
             #     model_weights="gpt-5-mini"
             # ),
         },
-        control_flow=KontexFlow(),
+        control_flow=KontexFlow(min_description_quality=MIN_DESCRIPTION_QUALITY),
         input_schema=IOSchema(
             fields={"full_knowledge": FullKnowledge},
             required=["full_knowledge"]
@@ -572,8 +627,8 @@ async def main():
         ),
         optimization=OptimizationConfig(
             budget=20,
-            pareto_set_size=1, #change pareto set size 
-            minibatch_size=1,
+            pareto_set_size=PARETO_SET_SIZE, #change pareto set size 
+            minibatch_size=MINI_BATCH_SIZE,
             enable_crossover=True,
             crossover_probability=0.3,
             mutation_types=["rewrite", "insert"]
