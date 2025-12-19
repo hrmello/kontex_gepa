@@ -29,25 +29,20 @@ sys.path.insert(0, str(gepa_dir))
 
 print(sys.path)
 from kontex.logging import logger
-from kontex.database import db
+# from kontex.database import db
 from kontex.knowledge import CollectedKnowledge
 from kontex.simulation.edd.table_knowledge import FullKnowledge
 from kontex.llm.scheduler import LLMScheduler
-from kontex.llm.agents import DummyAgent
-from kontex.settings import settings
 from kontex.specialist import Specialist
 from kontex.simulation.edd.simulation import edd_simulation
 from kontex.simulation.edd.edd_run_params import EDDRunConfig
 from kontex.orquestration import ConversationalWrapper
-from kontex.settings import settings
 
 from gepa import GEPAOptimizer, GEPAConfig
-from gepa.core.system import CompoundAISystem, LanguageModule, SequentialFlow, IOSchema
+from gepa.core.system import CompoundAISystem, LanguageModule, IOSchema
 from gepa.evaluation.base import SimpleEvaluator, SimpleFeedbackEvaluator
-from gepa.evaluation.metrics import ExactMatch, F1Score
 from gepa.inference.factory import InferenceFactory
 from gepa.config import InferenceConfig, OptimizationConfig, DatabaseConfig, ObservabilityConfig
-from gepa.evaluation.base import Evaluator, EvaluationResult, SimpleEvaluator
 from gepa.evaluation.metrics import Metric
 
 def run_conversation_simulation(
@@ -512,7 +507,7 @@ async def main():
     NUMBER_OF_THEMES = 3
     MAX_HIER_DEPTH = 3
     N_EMPLOYEES = 8
-    N_COLUMNS_PER_TABLE = 3
+    N_COLUMNS_PER_TABLE = 2
 
     # kontex conversation parameters
     MIN_DESCRIPTION_QUALITY = 8
