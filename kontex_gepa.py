@@ -1,16 +1,19 @@
 from typing import Any, Dict, List
 from pathlib import Path
 from dotenv import load_dotenv
+import pandas as pd
 import random
 import sys, os
 import math
 import numpy as np
 from uuid import UUID
 from sentence_transformers import SentenceTransformer, util
-from deepeval.metrics import GEval
-from deepeval.test_case import LLMTestCaseParams, LLMTestCase
 from langchain_openai import AzureChatOpenAI
+
+from deepeval.metrics import GEval, BaseMetric
+from deepeval.test_case import LLMTestCaseParams, LLMTestCase
 from deepeval.models.base_model import DeepEvalBaseLLM
+from deepeval.metrics.g_eval import Rubric
 
 # Add parent directory to path for importing gepa and kontex
 current_dir = Path(__file__).parent
@@ -29,7 +32,7 @@ print(sys.path)
 from kontex.logging import logger
 from kontex.database import db
 from kontex.knowledge import CollectedKnowledge
-from kontex.simulation.edd.table_knowledge import FullKnowledge
+from kontex.simulation.edd.table_knowledge import FullKnowledge, DomainKnowledge
 from kontex.llm.scheduler import LLMScheduler
 from kontex.llm.agents import DummyAgent
 from kontex.settings import settings
@@ -45,8 +48,47 @@ from gepa.evaluation.base import SimpleEvaluator
 from gepa.evaluation.metrics import ExactMatch, F1Score
 from gepa.inference.factory import InferenceFactory
 from gepa.config import InferenceConfig, OptimizationConfig, DatabaseConfig, ObservabilityConfig
-from gepa.evaluation.base import Evaluator, EvaluationResult, SimpleEvaluator
+from gepa.evaluation.base import Evaluator, EvaluationResult, SimpleEvaluator, SimpleFeedbackEvaluator
 from gepa.evaluation.metrics import Metric
+
+from parse_full_knowledge import parse_full_knowledge_from_string
+
+def parse_users_info_to_specialists(users_info_str: str) -> dict[str, Specialist]:
+    """
+    Parse the users_info string from CSV and create a dictionary of Specialist objects.
+
+    Parameters
+    ----------
+    users_info_str : str
+        String representation of a list of user dictionaries
+
+    Returns
+    -------
+    dict[str, Specialist]
+        Dictionary mapping user names to Specialist objects
+    """
+    import ast
+
+    # Parse the string as a Python literal
+    users_list = ast.literal_eval(users_info_str)
+
+    # Create dictionary of Specialist objects
+    specialists = {}
+    for user_info in users_list:
+        name = user_info['name']
+        specialist_type = user_info['type']
+        background_info = user_info.get('background_info')
+
+        # Create Specialist object
+        specialist = Specialist(
+            name=name,
+            type=specialist_type,
+            background_info=background_info
+        )
+
+        specialists[name] = specialist
+
+    return specialists
 
 def run_conversation_simulation(
     prompts: dict[str, str],
@@ -75,8 +117,9 @@ def run_conversation_simulation(
         description, final_critique_score = conversational_wrapper.run_conversation(
             table,
             initial_user,
-            min_description_quality=9,
-            max_conversation_depth = 15 # Limit the conversation depth to avoid long runtimes during testing
+            min_description_quality=7,
+            max_single_conversation=1,
+            max_conversation_depth=15  # Limit the conversation depth to avoid long runtimes during testing
         )
 
         logger.info(f"Final Table Description:\n{description}")
@@ -190,7 +233,7 @@ class KontexFlow:
                 print(f"Warning: Could not convert final_critique_score to float: {final_critique_score}")
                 final_critique_score = 0.0
 
-        # current_data['description'] = description
+        current_data['description'] = description
         current_data['output'] = final_critique_score
         logger.debug(f"Final critic score: {current_data['output']}")
         return current_data
@@ -244,13 +287,24 @@ class GEvalMetric(Metric):
         )
 
         self.azure_openai = AzureOpenAI(model=custom_model)
+
     def compute(self, prediction_description: str, reference_description: str) -> float:
         """
         Compute several criteria scores between prediction and reference descriptions.
         """
         weight_hallucination = 0.6
         weight_completeness = 0.4
+        print("Reference inside metric:", reference_description)
+        reference_description = reference_description[0]["expected_description"]
 
+        prediction_description = prediction_description[0]["description"]
+        table_name = list(prediction_description.keys())[0]
+        print("Table name", table_name)
+
+        prediction_description = prediction_description[table_name]
+
+        print("Prediction inside metric:", prediction_description)
+        print("Reference after indexing:", reference_description)
         factual_accuracy = GEval(
             name="Factual Accuracy",
             model = self.azure_openai,
@@ -274,11 +328,61 @@ class GEvalMetric(Metric):
             retrieval_context=[reference_description] 
         )
 
-        factual_accuracy_score = factual_accuracy.measure(test_case)
-        completeness_score = completeness.measure(test_case)
+        factual_accuracy_score, factual_accuracy_reason = self.convergence_geval_loop(factual_accuracy, test_case, n_runs = 20, max_retries = 3, min_std_error=0.05, n_runs_min=5)
+        completeness_score, completeness_reason = self.convergence_geval_loop(completeness, test_case, n_runs = 20, max_retries = 3, min_std_error=0.05, n_runs_min=5)
+        
+        aggregated_reasoning = self.aggregate_reasons([factual_accuracy_reason, completeness_reason])
         overall_score = (weight_hallucination*factual_accuracy_score + weight_completeness*completeness_score)
 
-        return overall_score
+        return overall_score, aggregated_reasoning
+
+    def convergence_geval_loop(self, metric: BaseMetric, test_case: LLMTestCase, n_runs: int = 10, max_retries: int = 3, n_runs_min: int = 10, min_std_error: float = 0.05):
+
+        retries = 0
+        sucessful_runs = 0
+        scores = list()
+        reasons = list()
+        n = 0
+        
+        while retries < max_retries and sucessful_runs < n_runs:
+            try:
+                print(f"{metric.name} run {n}")
+                score = metric.measure(test_case)
+                scores.append(score)
+
+                reasons.append(metric.reason)
+
+                print(f"{metric.name}:", score)
+                sucessful_runs += 1
+                n += 1
+
+                partial_std_deviation = np.std(scores)
+                partial_std_error = partial_std_deviation / np.sqrt(len(scores))
+                
+                print(f"Standard Error in run {n}: {partial_std_error}")
+                print(f"Reason: {metric.reason}")
+
+                if n >= n_runs_min and partial_std_error < min_std_error: # Confidence Interval = 0.95 if min_std_error = 0.05
+                    print(f"{metric.name} converged after {n} runs.")
+                    return np.mean(np.array(scores)), reasons
+                
+            except Exception as e:
+                print(f"Error during {metric.name} evaluation: {e}. Retrying...")
+                retries += 1
+                continue
+
+    def aggregate_reasons(self, reasons: List[str]) -> str:
+
+        prompt_aggregation = f"""
+        You are an expert AI assistant specialized in summarizing evaluation feedback.
+        Given multiple reasoning statements from different evaluation runs, your task is to aggregate them into a single coherent reasoning that captures the key points.  The aggregated reasoning must be as general as possible, rather than using specific names or methods.
+        
+        Here is a list of reasons for different evaluation metrics:
+        {reasons}"""
+
+        reasoning_aggregation = self.azure_openai.generate(prompt_aggregation)
+
+        return reasoning_aggregation
 
 class LLMJudgeMetric(Metric):
     """LLM Judge Metric."""
@@ -363,10 +467,10 @@ def generate_pareto_dataset(seed = 42):
                 forgetting_chance=0.7,
                 n_patients_zero=1,
                 connections=1.5,
-                table_info=[(theme, 3, 0.8)],
+                table_info=[(theme, 2, 0.8)],
             )
 
-        run, simulated_users, full_knowledge = edd_simulation(config, seed)
+        run, simulated_users, full_knowledge = edd_simulation(config, seed, theme = theme)
     
         domain_name = list(full_knowledge.domains.keys())[0]
         print("DOMAIN NAME", domain_name)
@@ -380,9 +484,15 @@ def generate_pareto_dataset(seed = 42):
         theme_dict["question"] = f"Describe the dataset related to {theme} operations, including key attributes and their significance."
         theme_dict["expected"] = 10
 
-        logger.debug(f"Table description: {full_knowledge.domains[domain_name].description}")
-        logger.debug(f"Column descriptions: {full_knowledge.domains[domain_name].facts}")
+        print(domain_description)
+        print(column_descriptions)
+        column_keys = column_descriptions.keys()
+        column_descriptions = "\n".join([f"- {col}: {column_descriptions[col]}" for col in column_keys])
+        theme_dict["expected_description"] = domain_name + "\n" + domain_description + "\n" + column_descriptions
 
+        logger.debug(f"Table description: {domain_description}")
+        logger.debug(f"Column descriptions: {column_descriptions}")
+        logger.debug(f"Simulated users: {simulated_users}")
         dataset.append(theme_dict)
 
     return dataset
@@ -393,16 +503,91 @@ def generate_pareto_dataset(seed = 42):
 
     # TODO: Use reasoning of deepeval metrics to create final_score 
 
+def get_data_from_df(df: pd.DataFrame, n: int = 5) -> FullKnowledge:
+    dataset = list()
+    i=0
+    for row in df.itertuples():
+        table_name = row.table_name
+        table_description = row.description
+        facts = eval(row.facts)
+        domain_name= row.table_theme    
+        domain_description = table_description
+        column_descriptions = facts
+        full_knowledge = FullKnowledge(title=table_name)
+        full_knowledge.add_domain(table_name, table_description)
+
+        for col, desc in facts.items():
+            full_knowledge.add_fact(table_name, col, desc)
+
+        print("DOMAIN NAME", domain_name)
+        print(facts)
+        domain_description = full_knowledge.domains[table_name].description
+        column_descriptions = full_knowledge.domains[table_name].facts
+
+        theme_dict = dict()
+        theme_dict["full_knowledge"] = full_knowledge
+        theme_dict["question"] = f"Describe the dataset related to {domain_name} operations, including key attributes and their significance."
+        theme_dict["expected"] = 10
+
+        column_keys = column_descriptions.keys()
+        column_descriptions = "\n".join([f"- {col}: {column_descriptions[col]}" for col in column_keys])
+        theme_dict["expected_description"] = domain_name + "\n" + domain_description + "\n" + column_descriptions
+
+        dataset.append(theme_dict)
+        i+=1
+        if i >= n:
+            break
+    return dataset
+
+
 async def main():
 
     # 1. Creating Kontex dataset
-    dataset = generate_pareto_dataset()
+    # dataset = generate_pareto_dataset()
 
-    print(dataset)
+    # Load CSV and deserialize FullKnowledge objects
+    csv_path = "../kontex/data/simulated_table_info.csv"
+
+    # Read CSV and deserialize complex objects
+    import csv
+    dataset = []
+
+    with open(csv_path, 'r', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            # Parse the full_knowledge string into a FullKnowledge object
+            full_knowledge_obj = parse_full_knowledge_from_string(
+                row['full_knowledge'],
+                FullKnowledge=FullKnowledge,
+                DomainKnowledge=DomainKnowledge
+            )
+
+            # Parse users_info into Specialist objects
+            users_with_knowledge = parse_users_info_to_specialists(row['users_info'])
+
+            # Create a dictionary with all CSV columns
+            row_dict = {
+                'full_knowledge': full_knowledge_obj,  # Deserialized FullKnowledge object
+                'run_id': UUID(row.get('run_id')) if row.get('run_id') else None,
+                'users_with_knowledge': users_with_knowledge,  # Dict of Specialist objects
+                'question': row.get('question'),
+                'expected': int(row.get('expected', 10)),
+                'expected_description': row.get('expected_description'),
+                'users_info': row.get('users_info')  # Keep original string for reference
+            }
+
+            dataset.append(row_dict)
+    # print(dataset)
+    # print(dataset[0]["title"])
+    # for data in dataset:
+    #     data["full_knowledge"] = instantiate_full_knowledge(data["full_knowledge"])
+
+
+    # print(dataset.dtype)
     # dpareto_size = 4
     # dpareto = dataset[:dpareto_size]
     # dfeedback = dataset[dpareto_size:]
-
+    
     # 2. System with 2 modules: questioner and critique
     system = CompoundAISystem(
         modules={
@@ -426,6 +611,7 @@ async def main():
                         - Example values
                         - Business context and relationships
                         
+                        This is very important: DO NOT ASK the specialist for SQL snippets to confirm data. You only need the metadata, not the data itself.
                         Question:
                         """,
                 model_weights="gpt-5-mini"
@@ -491,7 +677,7 @@ async def main():
         ),
         optimization=OptimizationConfig(
             budget=20,
-            pareto_set_size=1, #change pareto set size 
+            pareto_set_size=2,  # change pareto set size
             minibatch_size=1,
             enable_crossover=True,
             crossover_probability=0.3,
@@ -508,8 +694,9 @@ async def main():
     )
 
     # 4. Create evaluator (need to change metrics for Kontex)
-    evaluator = SimpleEvaluator([
-        AverageDiffScore(name="average_score")
+    evaluator = SimpleFeedbackEvaluator([
+        # AverageDiffScore(name="average_score")
+        GEvalMetric(name="geval_metric")
     ])
     
     # 5. Create inference client
