@@ -25,10 +25,14 @@ print(parent_dir)
 kontex_src_dir = parent_dir / "kontex" / "src"
 gepa_dir = parent_dir / "gepa" / "src" 
 
-sys.path.insert(0, str(kontex_src_dir))    
-sys.path.insert(0, str(gepa_dir))  
+sys.path.insert(0, str(kontex_src_dir))
+sys.path.insert(0, str(gepa_dir))
 
 print(sys.path)
+
+# IMPORTANT: Set persistent database before importing kontex modules
+os.environ['DATABASE_URL'] = 'sqlite:///kontex_gepa_data.db'
+
 from kontex.logging import logger
 from kontex.database import db
 from kontex.knowledge import CollectedKnowledge
@@ -117,7 +121,7 @@ def run_conversation_simulation(
         description, final_critique_score = conversational_wrapper.run_conversation(
             table,
             initial_user,
-            min_description_quality=7,
+            min_description_quality=6,
             max_single_conversation=1,
             max_conversation_depth=15  # Limit the conversation depth to avoid long runtimes during testing
         )
@@ -214,13 +218,19 @@ class KontexFlow:
 
         current_data = input_data.copy()
 
+        # Get or create run_id
+        current_run_id = input_data.get("run_id", UUID(int=0))
+
         description, final_critique_score = run_conversation_simulation(
-            run_id=input_data.get("run_id", UUID(int=0)),
+            run_id=current_run_id,
             prompts=prompts,
             simulated_users=input_data["users_with_knowledge"],
             full_knowledge=input_data["full_knowledge"],
             seed=42,
         )
+
+        # Store run_id in current_data for GEval metric to use
+        current_data['current_run_id'] = current_run_id
         logger.debug("Final critique score: {final_critique_score}")
 
         # Ensure we return a numeric value
@@ -265,9 +275,10 @@ class GEvalMetric(Metric):
     Metric that makes use of different criteria
     """
 
-    def __init__(self,  name: str = "geval_metric"):
+    def __init__(self,  name: str = "geval_metric", run_id: UUID = None):
         super().__init__(name)
         self.name = name
+        self.run_id = run_id  # Store run_id for database tracking
 
         config = EnvConfig(env_file = ".env")
         # Check for API key
@@ -295,6 +306,13 @@ class GEvalMetric(Metric):
         weight_hallucination = 0.6
         weight_completeness = 0.4
         print("Reference inside metric:", reference_description)
+
+        # Extract run_id if available in prediction data
+        if isinstance(prediction_description, list) and len(prediction_description) > 0:
+            pred_data = prediction_description[0]
+            if 'current_run_id' in pred_data:
+                self.run_id = pred_data['current_run_id']
+
         reference_description = reference_description[0]["expected_description"]
 
         prediction_description = prediction_description[0]["description"]
@@ -330,9 +348,33 @@ class GEvalMetric(Metric):
 
         factual_accuracy_score, factual_accuracy_reason = self.convergence_geval_loop(factual_accuracy, test_case, n_runs = 20, max_retries = 3, min_std_error=0.05, n_runs_min=5)
         completeness_score, completeness_reason = self.convergence_geval_loop(completeness, test_case, n_runs = 20, max_retries = 3, min_std_error=0.05, n_runs_min=5)
-        
+
         aggregated_reasoning = self.aggregate_reasons([factual_accuracy_reason, completeness_reason])
         overall_score = (weight_hallucination*factual_accuracy_score + weight_completeness*completeness_score)
+
+        # Store GEval metrics in database if run_id is available
+        if self.run_id:
+            try:
+                db.add_geval_metric(
+                    run_id=self.run_id,
+                    metric_name="factual_accuracy",
+                    score=int(factual_accuracy_score * 10),  # Convert to 0-10 scale
+                    reasoning=str(factual_accuracy_reason) if factual_accuracy_reason else None,
+                )
+                db.add_geval_metric(
+                    run_id=self.run_id,
+                    metric_name="completeness",
+                    score=int(completeness_score * 10),  # Convert to 0-10 scale
+                    reasoning=str(completeness_reason) if completeness_reason else None,
+                )
+                db.add_geval_metric(
+                    run_id=self.run_id,
+                    metric_name="overall_geval",
+                    score=int(overall_score * 10),  # Convert to 0-10 scale
+                    reasoning=aggregated_reasoning if aggregated_reasoning else None,
+                )
+            except Exception as e:
+                logger.warning(f"Failed to store GEval metrics in database: {e}")
 
         return overall_score, aggregated_reasoning
 
@@ -545,6 +587,8 @@ async def main():
     # 1. Creating Kontex dataset
     # dataset = generate_pareto_dataset()
 
+    pareto_size = 2
+    feedback_size = 1
     # Load CSV and deserialize FullKnowledge objects
     csv_path = "../kontex/data/simulated_table_info.csv"
 
@@ -588,6 +632,7 @@ async def main():
     # dpareto = dataset[:dpareto_size]
     # dfeedback = dataset[dpareto_size:]
     
+    dataset = dataset[:pareto_size + feedback_size]
     # 2. System with 2 modules: questioner and critique
     system = CompoundAISystem(
         modules={
@@ -677,8 +722,8 @@ async def main():
         ),
         optimization=OptimizationConfig(
             budget=20,
-            pareto_set_size=2,  # change pareto set size
-            minibatch_size=1,
+            pareto_set_size=pareto_size,  # change pareto set size
+            minibatch_size=feedback_size,
             enable_crossover=True,
             crossover_probability=0.3,
             mutation_types=["rewrite", "insert"]
