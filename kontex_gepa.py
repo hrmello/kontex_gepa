@@ -36,7 +36,7 @@ os.environ['DATABASE_URL'] = 'sqlite:///kontex_gepa_data.db'
 from kontex.logging import logger
 from kontex.database import db
 from kontex.knowledge import CollectedKnowledge
-from kontex.simulation.edd.table_knowledge import FullKnowledge, DomainKnowledge
+from kontex.simulation.edd.general_knowledge import FullKnowledge, DomainKnowledge
 from kontex.llm.scheduler import LLMScheduler
 from kontex.llm.agents import DummyAgent
 from kontex.settings import settings
@@ -584,12 +584,14 @@ def get_data_from_df(df: pd.DataFrame, n: int = 5) -> FullKnowledge:
 
 async def main():
 
-    # 1. Creating Kontex dataset
+    # 1. Creating Kontex dataset if you want to generate from scratch
     # dataset = generate_pareto_dataset()
+    # input()
 
     pareto_size = 2
     feedback_size = 1
-    # Load CSV and deserialize FullKnowledge objects
+
+    # Load CSV and deserialize FullKnowledge objects (loading kontex dataset from csv)
     csv_path = "../kontex/data/simulated_table_info.csv"
 
     # Read CSV and deserialize complex objects
