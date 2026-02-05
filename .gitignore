@@ -1,2 +1,5 @@
 *.log
-*.log
+logs_rlm/
+*.db
+__pycache__/
+.env
