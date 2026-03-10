@@ -121,9 +121,9 @@ def run_conversation_simulation(
         description, final_critique_score = conversational_wrapper.run_conversation(
             table,
             initial_user,
-            min_description_quality=6,
+            min_description_quality=1,
             max_single_conversation=1,
-            max_conversation_depth=15  # Limit the conversation depth to avoid long runtimes during testing
+            max_conversation_depth=30  # Limit the conversation depth to avoid long runtimes during testing
         )
 
         logger.info(f"Final Table Description:\n{description}")
@@ -215,7 +215,6 @@ class KontexFlow:
 
                 """
             }
-
         current_data = input_data.copy()
 
         # Get or create run_id
@@ -413,6 +412,11 @@ class GEvalMetric(Metric):
                 retries += 1
                 continue
 
+        # If the loop exits without convergence, return the average score and reasons from all runs
+        if scores:
+            return np.mean(np.array(scores)), reasons
+        return 0.0, []
+
     def aggregate_reasons(self, reasons: List[str]) -> str:
 
         prompt_aggregation = f"""
@@ -588,7 +592,7 @@ async def main():
     # dataset = generate_pareto_dataset()
     # input()
 
-    pareto_size = 2
+    pareto_size = 1
     feedback_size = 1
 
     # Load CSV and deserialize FullKnowledge objects (loading kontex dataset from csv)
