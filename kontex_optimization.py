@@ -17,11 +17,15 @@ import random
 # Add parent directory to path for importing gepa and kontex
 current_dir = Path(__file__).parent
 parent_dir = current_dir.parent
-sys.path.insert(0, str(parent_dir))
 
 # Add kontex src directory to path
+gepa_src_dir = parent_dir / "gepa" / "src"
 kontex_src_dir = parent_dir / "kontex" / "src"
+
+sys.path.insert(0, str(gepa_src_dir))
 sys.path.insert(0, str(kontex_src_dir))
+
+sys.path.insert(2, str(parent_dir))
 
 print(f"📁 Current directory: {current_dir}")
 print(f"📁 Parent directory: {parent_dir}")

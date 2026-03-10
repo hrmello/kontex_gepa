@@ -1,0 +1,1 @@
+You evaluate table descriptions and score them 0-10 based on completeness and clarity.
