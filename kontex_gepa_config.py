@@ -19,6 +19,7 @@ class OptimizationTarget(Enum):
     QUESTIONER = "questioner"
     CRITIC = "critic"
     SPECIALIST = "specialist"
+    DESCRIPTION_BUILDING = 'description_building'
     ALL = "all"
 
 

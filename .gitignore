@@ -3,3 +3,5 @@ logs_rlm/
 *.db
 __pycache__/
 .env
+data/
+kontex-gepa-integration.ipynb

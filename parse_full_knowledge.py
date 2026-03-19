@@ -171,7 +171,7 @@ def read_full_knowledge_from_csv(csv_path: str | Path, row_index: int = 0, FullK
         Parsed FullKnowledge object
     """
     if FullKnowledge is None or DomainKnowledge is None:
-        from kontex.simulation.edd.table_knowledge import DomainKnowledge, FullKnowledge
+        from kontex.simulation.edd.general_knowledge import DomainKnowledge, FullKnowledge
 
     with open(csv_path, 'r', encoding='utf-8') as f:
         reader = csv.DictReader(f)
@@ -201,7 +201,7 @@ def read_all_full_knowledge_from_csv(csv_path: str | Path, FullKnowledge=None, D
         List of all parsed FullKnowledge objects
     """
     if FullKnowledge is None or DomainKnowledge is None:
-        from kontex.simulation.edd.table_knowledge import DomainKnowledge, FullKnowledge
+        from kontex.simulation.edd.general_knowledge import DomainKnowledge, FullKnowledge
 
     results = []
     with open(csv_path, 'r', encoding='utf-8') as f:
@@ -217,7 +217,7 @@ def read_all_full_knowledge_from_csv(csv_path: str | Path, FullKnowledge=None, D
 if __name__ == "__main__":
     import sys
     sys.path.append('/home/kunumi/Área de trabalho/kunumi/kontex/src')
-    from kontex.simulation.edd.table_knowledge import DomainKnowledge, FullKnowledge
+    from kontex.simulation.edd.general_knowledge import DomainKnowledge, FullKnowledge
 
     csv_path = "/home/kunumi/Área de trabalho/kunumi/kontex/data/simulated_table_info.csv"
 

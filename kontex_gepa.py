@@ -9,6 +9,8 @@ import numpy as np
 from uuid import UUID
 from sentence_transformers import SentenceTransformer, util
 from langchain_openai import AzureChatOpenAI
+import json
+import random 
 
 from deepeval.metrics import GEval, BaseMetric
 from deepeval.test_case import LLMTestCaseParams, LLMTestCase
@@ -44,7 +46,6 @@ from kontex.specialist import Specialist
 from kontex.simulation.edd.simulation import edd_simulation
 from kontex.simulation.edd.edd_run_params import EDDRunConfig
 from kontex.orquestration import ConversationalWrapper
-from kontex.settings import settings
 
 from gepa import GEPAOptimizer, GEPAConfig
 from gepa.core.system import CompoundAISystem, LanguageModule, SequentialFlow, IOSchema
@@ -279,7 +280,7 @@ class GEvalMetric(Metric):
         self.name = name
         self.run_id = run_id  # Store run_id for database tracking
 
-        config = EnvConfig(env_file = ".env")
+        config = EnvConfig(env_file = "../env")
         # Check for API key
         self.api_key = config.api_key
         self.model = config.model
@@ -499,7 +500,7 @@ def compute_similarity(description, datapoint):
 
 def generate_pareto_dataset(seed = 42):
     from collections import defaultdict
-    table_themes = ["mining", "healthcare"] #"finance", "technology", "retail"]#, "education"]
+    table_themes = ["mining"] #"healthcare"] #"finance", "technology", "retail"]#, "education"]
     
     dataset = list()
 
@@ -528,6 +529,70 @@ def generate_pareto_dataset(seed = 42):
         theme_dict["run_id"] = run.id
         theme_dict["users_with_knowledge"] = simulated_users
         theme_dict["question"] = f"Describe the dataset related to {theme} operations, including key attributes and their significance."
+        theme_dict["expected"] = 10
+
+        print(domain_description)
+        print(column_descriptions)
+        column_keys = column_descriptions.keys()
+        column_descriptions = "\n".join([f"- {col}: {column_descriptions[col]}" for col in column_keys])
+        theme_dict["expected_description"] = domain_name + "\n" + domain_description + "\n" + column_descriptions
+
+        logger.debug(f"Table description: {domain_description}")
+        logger.debug(f"Column descriptions: {column_descriptions}")
+        logger.debug(f"Simulated users: {simulated_users}")
+        dataset.append(theme_dict)
+
+    return dataset
+
+def generate_hotpot_pareto_dataset(seed = 42):
+
+    with open("../data/hotpot/hotpot_train_v1.1.json") as f:
+        data = json.load(f)
+
+    qa = [
+            [item["question"], item["context"], item["answer"]] for item in data if item["level"] == "hard"
+        ]
+    
+    dataset = list()
+
+    for i in range(10):
+        theme = f"hotpotqa_question_{i}"
+
+        #external_question = qa[i][0]
+
+        raw_data = qa[i][1]
+
+        pre_existing_data = (raw_data, "HotPotQA", theme)
+
+        config = EDDRunConfig(
+            max_hier_depth=10,
+            n_employees=10,
+            mean_degree=math.ceil(5 ** (1 / 2)),
+            # alpha=0.1, original do kontex
+            alpha=0,  # para não haver vazamento de informação entre os especialistas
+            decay=0.8,
+            # forgetting_chance=0.7, original do kontex
+            forgetting_chance=0,  # para não haver esquecimento dos especialistas com relação ao que sabem
+            n_patients_zero=1,
+            connections=1.5,
+            table_info=[("mining", 3, 0.8)],
+            pre_existing_data=pre_existing_data,
+            external_specialist_role=True,
+            single_knowledge_employee=True,
+            )
+
+        run, simulated_users, full_knowledge = edd_simulation(config, seed, external_data=True)
+        
+        domain_name = list(full_knowledge.domains.keys())[0]
+        print("DOMAIN NAME", domain_name)
+        domain_description = full_knowledge.domains[domain_name].description
+        column_descriptions = full_knowledge.domains[domain_name].facts
+
+        theme_dict = dict()
+        theme_dict["full_knowledge"] = full_knowledge
+        theme_dict["run_id"] = run.id
+        theme_dict["users_with_knowledge"] = simulated_users
+        theme_dict["question"] = f"Find the answer to {theme}. Your answer must be succint."
         theme_dict["expected"] = 10
 
         print(domain_description)
@@ -589,7 +654,7 @@ def get_data_from_df(df: pd.DataFrame, n: int = 5) -> FullKnowledge:
 async def main():
 
     # 1. Creating Kontex dataset if you want to generate from scratch
-    # dataset = generate_pareto_dataset()
+    #dataset = generate_pareto_dataset()
     # input()
 
     pareto_size = 1
@@ -622,7 +687,7 @@ async def main():
                 'users_with_knowledge': users_with_knowledge,  # Dict of Specialist objects
                 'question': row.get('question'),
                 'expected': int(row.get('expected', 10)),
-                'expected_description': row.get('expected_description'),
+                '   ': row.get('expected_description'),
                 'users_info': row.get('users_info')  # Keep original string for reference
             }
 
