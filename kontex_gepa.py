@@ -202,7 +202,7 @@ def run_conversation_simulation(
         description, final_critique_score = conversational_wrapper.run_conversation(
             table,
             initial_user,
-            min_description_quality=3,
+            min_description_quality=7,
             max_single_conversation=1,
             max_conversation_depth=10,
             external_question=external_question,
@@ -266,12 +266,12 @@ class KontexFlow:
         )
 
         if final_critique_score is None:
-            final_critique_score = 0.0
+            final_critique_score = 0
         else:
             try:
-                final_critique_score = float(final_critique_score)
+                final_critique_score = int(round(float(final_critique_score)))
             except (ValueError, TypeError):
-                final_critique_score = 0.0
+                final_critique_score = 0
 
         current_data["current_run_id"] = current_run_id
         current_data["description"] = description
@@ -331,14 +331,16 @@ class KontexFlowGeneralized:
 
         try:
             current_data["output"] = (
-                float(final_critique_score) if final_critique_score is not None else 0.0
+                int(round(float(final_critique_score)))
+                if final_critique_score is not None
+                else 0
             )
         except (ValueError, TypeError):
             logger.warning(
-                f"Não foi possível converter score {final_critique_score} para float. "
-                "Usando 0.0."
+                f"Não foi possível converter score {final_critique_score} para int. "
+                "Usando 0."
             )
-            current_data["output"] = 0.0
+            current_data["output"] = 0
 
         current_data["description"] = description
         logger.debug(f"Final critic score: {current_data['output']}")
@@ -396,6 +398,18 @@ GEVAL_CRITERIA_TABLE = {
     ),
 }
 
+#: Input do LLMTestCase para o workflow HotPotQA.
+#: None significa "usar a question do datapoint" (comportamento padrão).
+GEVAL_TEST_CASE_INPUT_HOTPOTQA: str | None = None
+
+#: Input do LLMTestCase para o workflow de tabelas.
+#: Instrução fixa usada como contexto de avaliação pelo GEval.
+GEVAL_TEST_CASE_INPUT_TABLE: str = (
+    "Generate a comprehensive description of the table, covering all column names, "
+    "their data types, example values where relevant, and the business context and "
+    "purpose of each field."
+)
+
 
 class GEvalMetric(Metric):
     """
@@ -424,17 +438,19 @@ class GEvalMetric(Metric):
         run_id: UUID | None = None,
         factual_accuracy_criteria: str | None = None,
         completeness_criteria: str | None = None,
+        test_case_input: str | None = None,
     ):
         super().__init__(name)
         self.run_id = run_id
         self.factual_accuracy_criteria = (
-            factual_accuracy_criteria
-            or GEVAL_CRITERIA_HOTPOTQA["factual_accuracy"]
+            factual_accuracy_criteria or GEVAL_CRITERIA_HOTPOTQA["factual_accuracy"]
         )
         self.completeness_criteria = (
-            completeness_criteria
-            or GEVAL_CRITERIA_HOTPOTQA["completeness"]
+            completeness_criteria or GEVAL_CRITERIA_HOTPOTQA["completeness"]
         )
+        # None → usa a question do datapoint (workflow HotPotQA)
+        # string → usa este texto fixo como input (ex.: workflow de tabelas)
+        self.test_case_input = test_case_input
 
         config = EnvConfig(env_file=str(_this_dir / ".env"))
         self.api_key = config.api_key
@@ -467,12 +483,14 @@ class GEvalMetric(Metric):
                 self.run_id = pred_data["current_run_id"]
 
         reference_description = reference_description[0]["expected_description"]
-        question = prediction_description[0].get(
-            "question", "Answer the question based on the collected facts."
-        )
         raw_desc = prediction_description[0]["description"]
         table_name = list(raw_desc.keys())[0]
         prediction_str = raw_desc[table_name]
+
+        # Se test_case_input foi definido usa-o; caso contrário usa a question do datapoint
+        question = self.test_case_input or prediction_description[0].get(
+            "question", "Answer the question based on the collected facts."
+        )
 
         factual_accuracy = GEval(
             name="Factual Accuracy",
@@ -658,7 +676,8 @@ def generate_pareto_dataset(seed: int = 42) -> list[dict]:
 
 
 def generate_hotpot_pareto_dataset(
-    n: int = 4,
+    start_question: int = 0,
+    end_question:int = 4,
     seed: int = 42,
     hotpot_path: str | Path | None = None,
 ) -> list[dict]:
@@ -695,7 +714,7 @@ def generate_hotpot_pareto_dataset(
 
     dataset: list[dict] = []
 
-    for i in range(n):
+    for i in range(start_question,end_question):
         theme = f"hotpotqa_question_{i}"
         external_question = qa[i][0]
         expected_answer = qa[i][2]
