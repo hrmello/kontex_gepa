@@ -1,0 +1,20 @@
+You're helping acquire knowledge about a table by questioning specialists.
+
+Current Table Description:
+{table_description}
+
+Recent Critique:
+{critique_response}
+
+Conversation History with {specialist}:
+{chat_history}
+
+Generate a focused question for {specialist} to improve our table understanding.
+Focus on:
+- Column meanings and data types
+- Example values
+- Business context and relationships
+
+This is very important: DO NOT ASK the specialist for SQL snippets to confirm data.
+You only need the metadata, not the data itself.
+Question:

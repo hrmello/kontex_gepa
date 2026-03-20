@@ -1,117 +1,197 @@
-from typing import Any, Dict, List
-from pathlib import Path
-from dotenv import load_dotenv
-import pandas as pd
-import random
-import sys, os
-import math
-import numpy as np
-from uuid import UUID
-from sentence_transformers import SentenceTransformer, util
-from langchain_openai import AzureChatOpenAI
+"""
+kontex_gepa.py
+
+Integração do GEPA (Genetic Pareto Prompt Optimizer) com o Kontex para
+otimização de prompts de aquisição de conhecimento tácito.
+
+Exporta:
+    - EnvConfig: carrega variáveis de ambiente (.env)
+    - AzureOpenAI: wrapper DeepEval para Azure OpenAI
+    - run_conversation_simulation: executa uma simulação de conversa Kontex
+    - KontexFlow: fluxo de controle para o workflow de mineração (mining/EDD)
+    - KontexFlowGeneralized: fluxo de controle para o workflow HotPotQA
+    - AverageDiffScore, GEvalMetric, LLMJudgeMetric: métricas de avaliação
+    - generate_pareto_dataset: gera dataset via EDD (mining simulado)
+    - generate_hotpot_pareto_dataset: gera dataset via HotPotQA
+    - get_data_from_df: carrega dataset a partir de um DataFrame CSV
+    - parse_users_info_to_specialists: converte string CSV em Specialists
+"""
+
+from __future__ import annotations
+
+import ast
+import csv
 import json
-import random 
+import math
+import os
+import random
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List
+from uuid import UUID
+
+import numpy as np
+import pandas as pd
+from dotenv import load_dotenv
+from langchain_openai import AzureChatOpenAI
+from sentence_transformers import SentenceTransformer, util
 
 from deepeval.metrics import GEval, BaseMetric
-from deepeval.test_case import LLMTestCaseParams, LLMTestCase
 from deepeval.models.base_model import DeepEvalBaseLLM
 from deepeval.metrics.g_eval import Rubric
+from deepeval.test_case import LLMTestCase, LLMTestCaseParams
 
-# Add parent directory to path for importing gepa and kontex
-current_dir = Path(__file__).parent
-parent_dir = current_dir.parent
-sys.path.insert(0, str(parent_dir))
+# ---------------------------------------------------------------------------
+# Configuração de paths — permite executar tanto como script quanto como módulo
+# ---------------------------------------------------------------------------
+_this_dir = Path(__file__).parent
+_parent_dir = _this_dir.parent
 
-print(parent_dir)
-# Add kontex src directory to path
-kontex_src_dir = parent_dir / "kontex" / "src"
-gepa_dir = parent_dir / "gepa" / "src" 
+sys.path.insert(0, str(_parent_dir))
+sys.path.insert(0, str(_parent_dir / "kontex" / "src"))
+sys.path.insert(0, str(_parent_dir / "gepa" / "src"))
 
-sys.path.insert(0, str(kontex_src_dir))
-sys.path.insert(0, str(gepa_dir))
+# Banco de dados persistente (deve ser definido antes de importar módulos kontex)
+os.environ.setdefault("DATABASE_URL", f"sqlite:///{_this_dir}/kontex_gepa_data.db")
 
-print(sys.path)
-
-# IMPORTANT: Set persistent database before importing kontex modules
-os.environ['DATABASE_URL'] = 'sqlite:///kontex_gepa_data.db'
-
-from kontex.logging import logger
+# ---------------------------------------------------------------------------
+# Imports Kontex & GEPA
+# ---------------------------------------------------------------------------
 from kontex.database import db
 from kontex.knowledge import CollectedKnowledge
-from kontex.simulation.edd.general_knowledge import FullKnowledge, DomainKnowledge
-from kontex.llm.scheduler import LLMScheduler
-from kontex.llm.agents import DummyAgent
-from kontex.settings import settings
-from kontex.specialist import Specialist
-from kontex.simulation.edd.simulation import edd_simulation
-from kontex.simulation.edd.edd_run_params import EDDRunConfig
+from kontex.logging import logger
 from kontex.orquestration import ConversationalWrapper
+from kontex.settings import settings
+from kontex.simulation.edd.edd_run_params import EDDRunConfig
+from kontex.simulation.edd.general_knowledge import DomainKnowledge, FullKnowledge
+from kontex.simulation.edd.simulation import edd_simulation
+from kontex.llm.agents import DummyAgent
+from kontex.llm.scheduler import LLMScheduler
+from kontex.specialist import Specialist
+from kontex.llm.agents.hotpotqa_agents import (
+    hotpotqa_description_building_role,
+    hotpotqa_questioning_role,
+    hotpotqa_self_critique_role,
+    hotpotqa_subject_change_role,
+)
 
-from gepa import GEPAOptimizer, GEPAConfig
-from gepa.core.system import CompoundAISystem, LanguageModule, SequentialFlow, IOSchema
-from gepa.evaluation.base import SimpleEvaluator
-from gepa.evaluation.metrics import ExactMatch, F1Score
+from gepa import GEPAConfig, GEPAOptimizer
+from gepa.config import (
+    DatabaseConfig,
+    InferenceConfig,
+    ObservabilityConfig,
+    OptimizationConfig,
+)
+from gepa.core.system import CompoundAISystem, IOSchema, LanguageModule, SequentialFlow
+from gepa.evaluation.base import (
+    Evaluator,
+    EvaluationResult,
+    SimpleFeedbackEvaluator,
+    SimpleEvaluator,
+)
+from gepa.evaluation.metrics import ExactMatch, F1Score, Metric
 from gepa.inference.factory import InferenceFactory
-from gepa.config import InferenceConfig, OptimizationConfig, DatabaseConfig, ObservabilityConfig
-from gepa.evaluation.base import Evaluator, EvaluationResult, SimpleEvaluator, SimpleFeedbackEvaluator
-from gepa.evaluation.metrics import Metric
 
 from parse_full_knowledge import parse_full_knowledge_from_string
 
-def parse_users_info_to_specialists(users_info_str: str) -> dict[str, Specialist]:
-    """
-    Parse the users_info string from CSV and create a dictionary of Specialist objects.
+# ---------------------------------------------------------------------------
+# Helpers de ambiente e LLM
+# ---------------------------------------------------------------------------
 
-    Parameters
-    ----------
-    users_info_str : str
-        String representation of a list of user dictionaries
+class EnvConfig:
+    """Carrega variáveis de ambiente a partir de um arquivo .env."""
 
-    Returns
-    -------
-    dict[str, Specialist]
-        Dictionary mapping user names to Specialist objects
-    """
-    import ast
+    def __init__(self, env_file: str = ".env"):
+        env_path = Path(env_file)
+        if env_path.exists():
+            load_dotenv(env_path)
+            print(f"✓ Variáveis de ambiente carregadas de {env_file}")
+        else:
+            print(f"⚠ Arquivo {env_file} não encontrado")
 
-    # Parse the string as a Python literal
-    users_list = ast.literal_eval(users_info_str)
+        self.api_key = os.getenv("OPENAI_API_KEY")
+        self.base_url = os.getenv("OPENAI_API_BASE")
+        self.model = os.getenv("OPENAI_MODEL")
 
-    # Create dictionary of Specialist objects
-    specialists = {}
-    for user_info in users_list:
-        name = user_info['name']
-        specialist_type = user_info['type']
-        background_info = user_info.get('background_info')
 
-        # Create Specialist object
-        specialist = Specialist(
-            name=name,
-            type=specialist_type,
-            background_info=background_info
-        )
+class AzureOpenAI(DeepEvalBaseLLM):
+    """Wrapper DeepEval para um modelo AzureChatOpenAI (LangChain)."""
 
-        specialists[name] = specialist
+    def __init__(self, model):
+        self.model = model
 
-    return specialists
+    def load_model(self):
+        return self.model
+
+    def generate(self, prompt: str) -> str:
+        return self.load_model().invoke(prompt).content
+
+    async def a_generate(self, prompt: str) -> str:
+        res = await self.load_model().ainvoke(prompt)
+        return res.content
+
+    def get_model_name(self) -> str:
+        return "Custom Azure OpenAI Model"
+
+
+# ---------------------------------------------------------------------------
+# Simulação de conversa Kontex
+# ---------------------------------------------------------------------------
 
 def run_conversation_simulation(
-    prompts: dict[str, str],
     run_id: UUID,
     simulated_users: dict[str, Specialist],
     full_knowledge: FullKnowledge,
-    seed: int = None,
-) -> dict[str, str]:
-    rng = random.Random(seed)
+    prompts: dict[str, str] | None = None,
+    seed: int | None = None,
+    change_roles: bool = False,
+    new_roles: dict[str, str] | None = None,
+    external_question: str | None = None,
+) -> tuple[dict[str, str], float]:
+    """
+    Executa uma simulação de conversa Kontex para cada domínio em full_knowledge.
 
-    # TODO verificar como iremos lidar com múltiplas tabelas no futuro (se o agente tenta encontrar tudo de uma vez ou explora uma tabela por vez)
-    descriptions = {}
+    Parameters
+    ----------
+    run_id:
+        UUID da execução (usado para rastreamento no banco de dados).
+    simulated_users:
+        Dicionário {nome: Specialist} dos usuários simulados.
+    full_knowledge:
+        Objeto FullKnowledge com os domínios e fatos do conhecimento.
+    prompts:
+        Dicionário de prompts de usuário para cada papel. None usa os
+        templates padrão internos do agente.
+    seed:
+        Semente para reproducibilidade na escolha do usuário inicial.
+    change_roles:
+        Se True, usa new_roles para sobrescrever os system prompts dos agentes.
+    new_roles:
+        Dicionário {papel: system_prompt} para sobrescrever os papéis dos agentes.
+    external_question:
+        Questão externa a ser respondida pela simulação (ex.: HotPotQA).
+
+    Returns
+    -------
+    tuple[dict[str, str], float]
+        (descriptions, final_critique_score) onde descriptions mapeia
+        table_name -> description produzida pela simulação.
+    """
+    rng = random.Random(seed)
+    descriptions: dict[str, str] = {}
+
     for table_name, table_knowledge in full_knowledge.domains.items():
         table_columns = list(table_knowledge.facts.keys())
         initial_description = f"Table: {table_name}\nColumns: {table_columns}"
         table = CollectedKnowledge(table_name, initial_description)
 
-        scheduler = LLMScheduler(maxhist=0)  # Only use the most recent messages
+        scheduler = (
+            LLMScheduler(maxhist=0, new_roles=new_roles)
+            if change_roles
+            else LLMScheduler(maxhist=0)
+        )
+
         conversational_wrapper = ConversationalWrapper(
             scheduler,
             prompts,
@@ -122,103 +202,59 @@ def run_conversation_simulation(
         description, final_critique_score = conversational_wrapper.run_conversation(
             table,
             initial_user,
-            min_description_quality=1,
+            min_description_quality=3,
             max_single_conversation=1,
-            max_conversation_depth=30  # Limit the conversation depth to avoid long runtimes during testing
+            max_conversation_depth=10,
+            external_question=external_question,
+            external_data=True,
+            skip_hi_n_bye=True,
         )
 
         logger.info(f"Final Table Description:\n{description}")
-        logger.info(
-            f"\n-------------\nOriginal Description: \n{table_knowledge.facts}"
-        )
+        logger.info(f"\n-------------\nOriginal Description: \n{table_knowledge.facts}")
         logger.info(f"Final Critique Score: {final_critique_score}")
         descriptions[table_name] = description
+
     return descriptions, final_critique_score
 
-class EnvConfig:
-    """Configuration class to manage environment variables"""
-    
-    def __init__(self, env_file=".env"):
-        # Load environment variables from .env file
-        env_path = Path(env_file)
-        
-        if env_path.exists():
-            load_dotenv(env_path)
-            # print(load_dotenv(env_path))
-            print(f"✓ Loaded environment variables from {env_file}")
-        else:
-            print(f"⚠ Warning: {env_file} file not found")
-        
-        # Load all configuration
-        self.api_key = os.getenv("OPENAI_API_KEY")
-        self.base_url = os.getenv("OPENAI_API_BASE")
-        self.model = os.getenv("OPENAI_MODEL")
 
-class AzureOpenAI(DeepEvalBaseLLM):
-    def __init__(
-        self,
-        model
-    ):
-        self.model = model
-
-    def load_model(self):
-        return self.model
-
-    def generate(self, prompt: str) -> str:
-        chat_model = self.load_model()
-        return chat_model.invoke(prompt).content
-
-    async def a_generate(self, prompt: str) -> str:
-        chat_model = self.load_model()
-        res = await chat_model.ainvoke(prompt)
-        return res.content
-
-    def get_model_name(self):
-        return "Custom Azure OpenAI Model"
-
-
+# ---------------------------------------------------------------------------
+# Fluxos de controle GEPA
+# ---------------------------------------------------------------------------
 
 class KontexFlow:
-    """A placeholder for KontexFlow control flow logic."""
-    
+    """
+    Fluxo de controle para o workflow de mineração (dados simulados via EDD).
+
+    O GEPA otimiza o prompt do módulo 'questioning'. O crítico usa um
+    prompt fixo embutido neste fluxo.
+    """
+
     async def execute(
         self,
         modules: Dict[str, LanguageModule],
         input_data: Dict[str, Any],
-        inference_client: Any
+        inference_client: Any,
     ) -> Dict[str, Any]:
-        """Execute modules in a predefined KontexFlow manner."""
-
         current_data = input_data.copy()
 
-        logger.info("Prompts: \n\n -Questioning Module Prompt:\n")
-        logger.info(modules["questioning"].prompt)
-        # logger.info("\n -Critique Module Prompt:\n")
-        # logger.info(modules["critique"].prompt)
         prompts = {
             "questioning_prompt": modules["questioning"].prompt,
-            # "critique_prompt": modules["critique"].prompt
-            "critique_prompt": """
-                Evaluate the completeness of this table description:
-                        
-                         {tacit_knowledge}
-                        
-                         Provide assessment in this format:
-                         Score: [0-10]
-                         Reasoning: [why this score]
-                         Suggestions: [what's missing]
-                        
-                         To score high (8+), description needs:
-                         - All column names and meanings
-                         - Data types for each column
-                         - Example values where relevant
-                         - Business context and purpose
+            "critique_prompt": (
+                "Evaluate the completeness of this table description:\n\n"
+                "{tacit_knowledge}\n\n"
+                "Provide assessment in this format:\n"
+                "Score: [0-10]\n"
+                "Reasoning: [why this score]\n"
+                "Suggestions: [what's missing]\n\n"
+                "To score high (8+), description needs:\n"
+                "- All column names and meanings\n"
+                "- Data types for each column\n"
+                "- Example values where relevant\n"
+                "- Business context and purpose"
+            ),
+        }
 
-                """
-            }
-        current_data = input_data.copy()
-
-        # Get or create run_id
         current_run_id = input_data.get("run_id", UUID(int=0))
 
         description, final_critique_score = run_conversation_simulation(
@@ -229,557 +265,584 @@ class KontexFlow:
             seed=42,
         )
 
-        # Store run_id in current_data for GEval metric to use
-        current_data['current_run_id'] = current_run_id
-        logger.debug("Final critique score: {final_critique_score}")
-
-        # Ensure we return a numeric value
         if final_critique_score is None:
             final_critique_score = 0.0
-        elif not isinstance(final_critique_score, (int, float)):
+        else:
             try:
                 final_critique_score = float(final_critique_score)
             except (ValueError, TypeError):
-                print(f"Warning: Could not convert final_critique_score to float: {final_critique_score}")
                 final_critique_score = 0.0
 
-        current_data['description'] = description
-        current_data['output'] = final_critique_score
+        current_data["current_run_id"] = current_run_id
+        current_data["description"] = description
+        current_data["output"] = final_critique_score
+        logger.debug(f"Final critic score: {final_critique_score}")
+        return current_data
+
+
+class KontexFlowGeneralized:
+    """
+    Fluxo de controle generalizado para o workflow HotPotQA.
+
+    O GEPA otimiza o prompt do módulo 'description_building' (system prompt
+    do agente de construção de descrição). Os demais papéis (questioning,
+    subject_change, self_critique) usam os templates padrão do HotPotQA.
+    """
+
+    async def execute(
+        self,
+        modules: Dict[str, LanguageModule],
+        input_data: Dict[str, Any],
+        inference_client: Any,
+    ) -> Dict[str, Any]:
+        current_data = input_data.copy()
+
+        # O GEPA evolui modules['description_building'].prompt
+        new_roles = {
+            "questioning": hotpotqa_questioning_role,
+            "subject_change": hotpotqa_subject_change_role,
+            "self_critique": hotpotqa_self_critique_role,
+            "description_building": modules["description_building"].prompt,
+        }
+
+        # None → usa o template de mensagem padrão interno de cada agente
+        prompts = {
+            "questioning": None,
+            "self_critique": None,
+            "description_building": None,
+        }
+
+        raw_run_id = input_data.get("run_id", UUID(int=0))
+        current_run_id = getattr(raw_run_id, "id", raw_run_id)
+
+        description, final_critique_score = run_conversation_simulation(
+            run_id=current_run_id,
+            prompts=prompts,
+            simulated_users=input_data.get("users_with_knowledge", {}),
+            full_knowledge=input_data.get("full_knowledge"),
+            change_roles=True,
+            new_roles=new_roles,
+            seed=42,
+            external_question=input_data.get("question"),
+        )
+
+        current_data["current_run_id"] = current_run_id
+        current_data["question"] = input_data.get("question", "")
+
+        try:
+            current_data["output"] = (
+                float(final_critique_score) if final_critique_score is not None else 0.0
+            )
+        except (ValueError, TypeError):
+            logger.warning(
+                f"Não foi possível converter score {final_critique_score} para float. "
+                "Usando 0.0."
+            )
+            current_data["output"] = 0.0
+
+        current_data["description"] = description
         logger.debug(f"Final critic score: {current_data['output']}")
         return current_data
-    
+
+
+# ---------------------------------------------------------------------------
+# Métricas de avaliação
+# ---------------------------------------------------------------------------
+
 class AverageDiffScore(Metric):
-    """Average Difference Score Metric."""
-    
+    """Diferença média entre score esperado (10) e score do crítico."""
+
     def __init__(self, name: str = "score"):
         super().__init__(name)
-       
-    
+
     def compute(self, predictions: List[Any], references: List[Any]) -> float:
-        """Compute exact match score."""
-        
-        logger.debug(f"Predictions: {predictions}")
-        logger.debug(f"References: {references}")
+        scores = [10 - (ref - pred["output"]) for pred, ref in zip(predictions, references)]
+        return float(np.mean(np.array(scores)))
 
-        scores = []
-        for pred, ref in zip(predictions, references):
-            diff = 10 - (ref - pred["output"])  # max score is 10
-            scores.append(diff)
 
-        logger.debug(f"Scores: {scores}")
-        logger.debug(f"Mean score: {np.mean(np.array(scores))}")
-        return np.mean(np.array(scores))
+# ---------------------------------------------------------------------------
+# Critérios padrão para GEvalMetric — podem ser sobrescritos nos notebooks
+# ---------------------------------------------------------------------------
+
+#: Critérios para o workflow HotPotQA (resposta a perguntas sobre múltiplos documentos)
+GEVAL_CRITERIA_HOTPOTQA = {
+    "factual_accuracy": (
+        "Evaluate whether the answer produced by the questioning agent, based on facts "
+        "collected from specialist agents, contains any fabricated, hallucinated, or "
+        "incorrect information when compared to the expected answer. Penalize heavily "
+        "for facts invented by the agent that are not supported by or contradict the "
+        "expected answer."
+    ),
+    "completeness": (
+        "Evaluate how thoroughly the questioning agent collected relevant facts from "
+        "specialist agents to answer the original question. Assess whether the produced "
+        "answer covers all key information present in the expected answer, and penalize "
+        "for important facts or details that are missing."
+    ),
+}
+
+#: Critérios para o workflow de tabelas (mineração / dados simulados via EDD)
+GEVAL_CRITERIA_TABLE = {
+    "factual_accuracy": (
+        "Evaluate whether the table description produced by the agent accurately reflects "
+        "the expected description. Check that column names, data types, and business meanings "
+        "are correctly reported. Penalize heavily for invented columns, wrong data types, or "
+        "descriptions that contradict the expected reference."
+    ),
+    "completeness": (
+        "Evaluate how completely the agent described the table. Assess whether all columns "
+        "are covered with their names, data types, and business context. Penalize for missing "
+        "columns, absent data type information, or lack of business meaning for relevant fields."
+    ),
+}
+
 
 class GEvalMetric(Metric):
     """
-    Metric that makes use of different criteria
+    Métrica composta baseada em GEval (DeepEval).
+
+    Os critérios de avaliação são configuráveis via ``factual_accuracy_criteria``
+    e ``completeness_criteria``, permitindo adaptar a métrica ao contexto de uso
+    (HotPotQA, tabelas, etc.) sem alterar o código da classe.
+
+    Use as constantes ``GEVAL_CRITERIA_HOTPOTQA`` ou ``GEVAL_CRITERIA_TABLE``
+    como ponto de partida, ou defina critérios próprios no início do notebook.
+
+    Exemplo::
+
+        evaluator = SimpleFeedbackEvaluator([
+            GEvalMetric(
+                factual_accuracy_criteria=GEVAL_CRITERIA_TABLE["factual_accuracy"],
+                completeness_criteria=GEVAL_CRITERIA_TABLE["completeness"],
+            )
+        ])
     """
 
-    def __init__(self,  name: str = "geval_metric", run_id: UUID = None):
+    def __init__(
+        self,
+        name: str = "geval_metric",
+        run_id: UUID | None = None,
+        factual_accuracy_criteria: str | None = None,
+        completeness_criteria: str | None = None,
+    ):
         super().__init__(name)
-        self.name = name
-        self.run_id = run_id  # Store run_id for database tracking
+        self.run_id = run_id
+        self.factual_accuracy_criteria = (
+            factual_accuracy_criteria
+            or GEVAL_CRITERIA_HOTPOTQA["factual_accuracy"]
+        )
+        self.completeness_criteria = (
+            completeness_criteria
+            or GEVAL_CRITERIA_HOTPOTQA["completeness"]
+        )
 
-        config = EnvConfig(env_file = "../env")
-        # Check for API key
+        config = EnvConfig(env_file=str(_this_dir / ".env"))
         self.api_key = config.api_key
         self.model = config.model
+
         azure_endpoint = "https://azureopenai4k.openai.azure.com/"
         openai_api_version = "2025-01-01-preview"
         azure_deployment = "gpt-5-mini"
 
-    # Replace these with real values
         custom_model = AzureChatOpenAI(
-            model = self.model,
-            azure_endpoint = azure_endpoint,
+            model=self.model,
+            azure_endpoint=azure_endpoint,
             azure_deployment=azure_deployment,
-            openai_api_key = self.api_key,
-            openai_api_version = openai_api_version,
+            openai_api_key=self.api_key,
+            openai_api_version=openai_api_version,
         )
-
         self.azure_openai = AzureOpenAI(model=custom_model)
 
-    def compute(self, prediction_description: str, reference_description: str) -> float:
-        """
-        Compute several criteria scores between prediction and reference descriptions.
-        """
+    def compute(
+        self,
+        prediction_description: Any,
+        reference_description: Any,
+    ) -> tuple[float, str]:
         weight_hallucination = 0.6
         weight_completeness = 0.4
-        print("Reference inside metric:", reference_description)
 
-        # Extract run_id if available in prediction data
-        if isinstance(prediction_description, list) and len(prediction_description) > 0:
+        if isinstance(prediction_description, list) and prediction_description:
             pred_data = prediction_description[0]
-            if 'current_run_id' in pred_data:
-                self.run_id = pred_data['current_run_id']
+            if "current_run_id" in pred_data:
+                self.run_id = pred_data["current_run_id"]
 
         reference_description = reference_description[0]["expected_description"]
+        question = prediction_description[0].get(
+            "question", "Answer the question based on the collected facts."
+        )
+        raw_desc = prediction_description[0]["description"]
+        table_name = list(raw_desc.keys())[0]
+        prediction_str = raw_desc[table_name]
 
-        prediction_description = prediction_description[0]["description"]
-        table_name = list(prediction_description.keys())[0]
-        print("Table name", table_name)
-
-        prediction_description = prediction_description[table_name]
-
-        print("Prediction inside metric:", prediction_description)
-        print("Reference after indexing:", reference_description)
         factual_accuracy = GEval(
             name="Factual Accuracy",
-            model = self.azure_openai,
-            criteria="Evaluate whether the actual output contains any made-up, incorrect, or fabricated facts when compared to the expected output. Penalize heavily for invented information.",
-            evaluation_params=[LLMTestCaseParams.ACTUAL_OUTPUT, LLMTestCaseParams.EXPECTED_OUTPUT],
-            threshold=0.7
+            model=self.azure_openai,
+            criteria=self.factual_accuracy_criteria,
+            evaluation_params=[
+                LLMTestCaseParams.INPUT,
+                LLMTestCaseParams.ACTUAL_OUTPUT,
+                LLMTestCaseParams.EXPECTED_OUTPUT,
+            ],
+            threshold=0.7,
         )
 
         completeness = GEval(
             name="Completeness",
-            model = self.azure_openai,
-            criteria="Evaluate how much of the key information from the expected output is covered in the actual output. Check for missing variables, descriptions, or important details.",
-            evaluation_params=[LLMTestCaseParams.ACTUAL_OUTPUT, LLMTestCaseParams.EXPECTED_OUTPUT],
-            threshold=0.7
+            model=self.azure_openai,
+            criteria=self.completeness_criteria,
+            evaluation_params=[
+                LLMTestCaseParams.INPUT,
+                LLMTestCaseParams.ACTUAL_OUTPUT,
+                LLMTestCaseParams.EXPECTED_OUTPUT,
+            ],
+            threshold=0.7,
         )
-    
+
         test_case = LLMTestCase(
-            input="Provide a comprehensive description of the MineProcessAssays table, including detailed variable descriptions for GRDFe_A, RCV_PCT, and SMP_RUNID with their data types, purposes, expected ranges, common issues, validation rules, and relationships to other tables.",
-            actual_output=prediction_description,
+            input=question,
+            actual_output=prediction_str,
             expected_output=reference_description,
-            retrieval_context=[reference_description] 
+            retrieval_context=[reference_description],
         )
 
-        factual_accuracy_score, factual_accuracy_reason = self.convergence_geval_loop(factual_accuracy, test_case, n_runs = 20, max_retries = 3, min_std_error=0.05, n_runs_min=5)
-        completeness_score, completeness_reason = self.convergence_geval_loop(completeness, test_case, n_runs = 20, max_retries = 3, min_std_error=0.05, n_runs_min=5)
+        fa_score, fa_reason = self._convergence_loop(
+            factual_accuracy, test_case, n_runs=20, max_retries=3, min_std_error=0.05, n_runs_min=5
+        )
+        comp_score, comp_reason = self._convergence_loop(
+            completeness, test_case, n_runs=20, max_retries=3, min_std_error=0.05, n_runs_min=5
+        )
 
-        aggregated_reasoning = self.aggregate_reasons([factual_accuracy_reason, completeness_reason])
-        overall_score = (weight_hallucination*factual_accuracy_score + weight_completeness*completeness_score)
+        aggregated_reasoning = self._aggregate_reasons([fa_reason, comp_reason])
+        overall_score = weight_hallucination * fa_score + weight_completeness * comp_score
 
-        # Store GEval metrics in database if run_id is available
         if self.run_id:
             try:
-                db.add_geval_metric(
-                    run_id=self.run_id,
-                    metric_name="factual_accuracy",
-                    score=int(factual_accuracy_score * 10),  # Convert to 0-10 scale
-                    reasoning=str(factual_accuracy_reason) if factual_accuracy_reason else None,
-                )
-                db.add_geval_metric(
-                    run_id=self.run_id,
-                    metric_name="completeness",
-                    score=int(completeness_score * 10),  # Convert to 0-10 scale
-                    reasoning=str(completeness_reason) if completeness_reason else None,
-                )
-                db.add_geval_metric(
-                    run_id=self.run_id,
-                    metric_name="overall_geval",
-                    score=int(overall_score * 10),  # Convert to 0-10 scale
-                    reasoning=aggregated_reasoning if aggregated_reasoning else None,
-                )
+                db.add_geval_metric(run_id=self.run_id, metric_name="factual_accuracy",
+                                    score=int(fa_score * 10), reasoning=str(fa_reason) or None)
+                db.add_geval_metric(run_id=self.run_id, metric_name="completeness",
+                                    score=int(comp_score * 10), reasoning=str(comp_reason) or None)
+                db.add_geval_metric(run_id=self.run_id, metric_name="overall_geval",
+                                    score=int(overall_score * 10), reasoning=aggregated_reasoning or None)
             except Exception as e:
-                logger.warning(f"Failed to store GEval metrics in database: {e}")
+                logger.warning(f"Falha ao salvar métricas GEval no banco: {e}")
 
         return overall_score, aggregated_reasoning
 
-    def convergence_geval_loop(self, metric: BaseMetric, test_case: LLMTestCase, n_runs: int = 10, max_retries: int = 3, n_runs_min: int = 10, min_std_error: float = 0.05):
+    def _convergence_loop(
+        self,
+        metric: BaseMetric,
+        test_case: LLMTestCase,
+        n_runs: int = 10,
+        max_retries: int = 3,
+        n_runs_min: int = 10,
+        min_std_error: float = 0.05,
+    ) -> tuple[float, list]:
+        retries = successful_runs = n = 0
+        scores: list[float] = []
+        reasons: list = []
 
-        retries = 0
-        sucessful_runs = 0
-        scores = list()
-        reasons = list()
-        n = 0
-        
-        while retries < max_retries and sucessful_runs < n_runs:
+        while retries < max_retries and successful_runs < n_runs:
             try:
-                print(f"{metric.name} run {n}")
                 score = metric.measure(test_case)
                 scores.append(score)
-
                 reasons.append(metric.reason)
-
-                print(f"{metric.name}:", score)
-                sucessful_runs += 1
+                successful_runs += 1
                 n += 1
 
-                partial_std_deviation = np.std(scores)
-                partial_std_error = partial_std_deviation / np.sqrt(len(scores))
-                
-                print(f"Standard Error in run {n}: {partial_std_error}")
-                print(f"Reason: {metric.reason}")
-
-                if n >= n_runs_min and partial_std_error < min_std_error: # Confidence Interval = 0.95 if min_std_error = 0.05
-                    print(f"{metric.name} converged after {n} runs.")
-                    return np.mean(np.array(scores)), reasons
-                
+                std_error = np.std(scores) / np.sqrt(len(scores))
+                if n >= n_runs_min and std_error < min_std_error:
+                    return float(np.mean(scores)), reasons
             except Exception as e:
-                print(f"Error during {metric.name} evaluation: {e}. Retrying...")
+                print(f"Erro em {metric.name}: {e}. Tentando novamente...")
                 retries += 1
-                continue
 
-        # If the loop exits without convergence, return the average score and reasons from all runs
-        if scores:
-            return np.mean(np.array(scores)), reasons
-        return 0.0, []
+        return (float(np.mean(scores)), reasons) if scores else (0.0, [])
 
-    def aggregate_reasons(self, reasons: List[str]) -> str:
+    def _aggregate_reasons(self, reasons: list) -> str:
+        prompt = (
+            "You are an expert AI assistant specialized in summarizing evaluation feedback.\n"
+            "Given multiple reasoning statements from different evaluation runs, aggregate them "
+            "into a single coherent reasoning that captures the key points. The aggregated "
+            "reasoning must be as general as possible, rather than using specific names or methods.\n\n"
+            f"Reasons:\n{reasons}"
+        )
+        return self.azure_openai.generate(prompt)
 
-        prompt_aggregation = f"""
-        You are an expert AI assistant specialized in summarizing evaluation feedback.
-        Given multiple reasoning statements from different evaluation runs, your task is to aggregate them into a single coherent reasoning that captures the key points.  The aggregated reasoning must be as general as possible, rather than using specific names or methods.
-        
-        Here is a list of reasons for different evaluation metrics:
-        {reasons}"""
-
-        reasoning_aggregation = self.azure_openai.generate(prompt_aggregation)
-
-        return reasoning_aggregation
 
 class LLMJudgeMetric(Metric):
-    """LLM Judge Metric."""
-    
+    """Métrica placeholder que simula um juiz LLM (retorna score aleatório)."""
+
     def __init__(self, name: str = "llm_judge"):
         super().__init__(name)
-       
-    
+
     def compute(self, predictions: List[Any], references: List[Any]) -> float:
-        """Compute exact match score."""
-        
-        logger.debug(f"Predictions: {predictions}")
-        logger.debug(f"References: {references}")
+        scores = [random.uniform(0, 10) for _ in zip(predictions, references)]
+        return float(np.mean(np.array(scores)))
 
-        scores = []
-        for pred, ref in zip(predictions, references):
-            # Here we would call an LLM to judge the quality of pred against ref
-            # For simplicity, we'll use a dummy score
-            judge_score = random.uniform(0, 10)  # Dummy score between 0 and 10
-            scores.append(judge_score)
 
-        logger.debug(f"Scores: {scores}")
-        logger.debug(f"Mean score: {np.mean(np.array(scores))}")
-        return np.mean(np.array(scores))
-    
+# ---------------------------------------------------------------------------
+# Geração de datasets
+# ---------------------------------------------------------------------------
 
-def evaluate_prompt_kontex(prompts:dict, dataset: dict):
+def parse_users_info_to_specialists(users_info_str: str) -> dict[str, Specialist]:
+    """
+    Converte a string da coluna 'users_info' do CSV para um dicionário de Specialists.
 
-    descriptions_dataset = list()
-    scores_dataset = list()
-    for datapoint in dataset:
-        description = run_conversation_simulation(
-            initial_prompts=prompts,
-            simulated_users=datapoint["users_with_knowledge"],
-            full_knowledge=datapoint["full_knowledge"],
-            seed=42,
+    Parameters
+    ----------
+    users_info_str:
+        String Python literal representando uma lista de dicts com chaves
+        'name', 'type' e opcionalmente 'background_info'.
+
+    Returns
+    -------
+    dict[str, Specialist]
+        Dicionário {nome: Specialist}.
+    """
+    users_list = ast.literal_eval(users_info_str)
+    return {
+        u["name"]: Specialist(
+            name=u["name"],
+            type=u["type"],
+            background_info=u.get("background_info"),
         )
-    
-        descriptions_dataset.append(description)
+        for u in users_list
+    }
 
-        similarity_matrix, score = compute_similarity(description, datapoint)
 
-        scores_dataset.append(score)
-    return descriptions_dataset, scores_dataset
-
-def compute_similarity(description, datapoint):
+def generate_pareto_dataset(seed: int = 42) -> list[dict]:
     """
-    Compute the semantic similarity between the description and the facts in full_knowledge.
+    Gera um dataset de treinamento via simulação EDD (dados de mineração simulados).
+
+    Returns
+    -------
+    list[dict]
+        Lista de dicts com chaves: full_knowledge, run_id, users_with_knowledge,
+        question, expected, expected_description.
     """
-
-    desc_texts = list(description.values())
-    domain = list(datapoint["full_knowledge"].domains.keys())[0]
-    facts_texts = list(datapoint["full_knowledge"].domains[domain].facts.values())
-
-    model = SentenceTransformer('all-MiniLM-L6-v2')
-
-    # Compute embeddings
-    desc_emb = model.encode(desc_texts, convert_to_tensor=True)
-    facts_emb = model.encode(facts_texts, convert_to_tensor=True)
-
-    # Cosine simlarity
-    similarity_matrix = util.cos_sim(desc_emb, facts_emb)
-
-    # Aggregate the scores (e.g., mean of max similarities for each description)
-    score = similarity_matrix.max(dim=1).values.mean().item()
-
-    return similarity_matrix, score
-
-def generate_pareto_dataset(seed = 42):
-    from collections import defaultdict
-    table_themes = ["mining"] #"healthcare"] #"finance", "technology", "retail"]#, "education"]
-    
-    dataset = list()
+    table_themes = ["mining"]
+    dataset: list[dict] = []
 
     for theme in table_themes:
         config = EDDRunConfig(
-                max_hier_depth=2,
-                n_employees=5,
-                mean_degree=math.ceil(5 ** (1 / 2)),
-                alpha=0.1,
-                decay=0.8,
-                forgetting_chance=0.7,
-                n_patients_zero=1,
-                connections=1.5,
-                table_info=[(theme, 2, 0.8)],
-            )
+            max_hier_depth=2,
+            n_employees=5,
+            mean_degree=math.ceil(5 ** 0.5),
+            alpha=0.1,
+            decay=0.8,
+            forgetting_chance=0.7,
+            n_patients_zero=1,
+            connections=1.5,
+            table_info=[(theme, 2, 0.8)],
+        )
+        run, simulated_users, full_knowledge = edd_simulation(config, seed, theme=theme)
 
-        run, simulated_users, full_knowledge = edd_simulation(config, seed, theme = theme)
-    
         domain_name = list(full_knowledge.domains.keys())[0]
-        print("DOMAIN NAME", domain_name)
         domain_description = full_knowledge.domains[domain_name].description
         column_descriptions = full_knowledge.domains[domain_name].facts
+        col_text = "\n".join(f"- {k}: {v}" for k, v in column_descriptions.items())
 
-        theme_dict = dict()
-        theme_dict["full_knowledge"] = full_knowledge
-        theme_dict["run_id"] = run.id
-        theme_dict["users_with_knowledge"] = simulated_users
-        theme_dict["question"] = f"Describe the dataset related to {theme} operations, including key attributes and their significance."
-        theme_dict["expected"] = 10
-
-        print(domain_description)
-        print(column_descriptions)
-        column_keys = column_descriptions.keys()
-        column_descriptions = "\n".join([f"- {col}: {column_descriptions[col]}" for col in column_keys])
-        theme_dict["expected_description"] = domain_name + "\n" + domain_description + "\n" + column_descriptions
-
-        logger.debug(f"Table description: {domain_description}")
-        logger.debug(f"Column descriptions: {column_descriptions}")
-        logger.debug(f"Simulated users: {simulated_users}")
-        dataset.append(theme_dict)
+        dataset.append({
+            "full_knowledge": full_knowledge,
+            "run_id": run.id,
+            "users_with_knowledge": simulated_users,
+            "question": (
+                f"Describe the dataset related to {theme} operations, "
+                "including key attributes and their significance."
+            ),
+            "expected": 10,
+            "expected_description": domain_name + "\n" + domain_description + "\n" + col_text,
+        })
 
     return dataset
 
-def generate_hotpot_pareto_dataset(seed = 42):
 
-    with open("../data/hotpot/hotpot_train_v1.1.json") as f:
+def generate_hotpot_pareto_dataset(
+    n: int = 4,
+    seed: int = 42,
+    hotpot_path: str | Path | None = None,
+) -> list[dict]:
+    """
+    Gera um dataset de treinamento a partir do HotPotQA (questões de nível 'hard').
+
+    Parameters
+    ----------
+    n:
+        Número de questões a usar (padrão 4).
+    seed:
+        Semente para reproducibilidade da simulação EDD.
+    hotpot_path:
+        Caminho para o arquivo hotpot_train_v1.1.json. Se None, usa
+        data/hotpot_train_v1.1.json relativo a este módulo.
+
+    Returns
+    -------
+    list[dict]
+        Lista de dicts com chaves: full_knowledge, run_id, users_with_knowledge,
+        question, expected, expected_description.
+    """
+    if hotpot_path is None:
+        hotpot_path = _this_dir / "data" / "hotpot_train_v1.1.json"
+
+    with open(hotpot_path) as f:
         data = json.load(f)
 
     qa = [
-            [item["question"], item["context"], item["answer"]] for item in data if item["level"] == "hard"
-        ]
-    
-    dataset = list()
+        [item["question"], item["context"], item["answer"]]
+        for item in data
+        if item["level"] == "hard"
+    ]
 
-    for i in range(10):
+    dataset: list[dict] = []
+
+    for i in range(n):
         theme = f"hotpotqa_question_{i}"
-
-        #external_question = qa[i][0]
-
+        external_question = qa[i][0]
+        expected_answer = qa[i][2]
         raw_data = qa[i][1]
-
-        pre_existing_data = (raw_data, "HotPotQA", theme)
 
         config = EDDRunConfig(
             max_hier_depth=10,
             n_employees=10,
-            mean_degree=math.ceil(5 ** (1 / 2)),
-            # alpha=0.1, original do kontex
-            alpha=0,  # para não haver vazamento de informação entre os especialistas
+            mean_degree=math.ceil(5 ** 0.5),
+            alpha=0,
             decay=0.8,
-            # forgetting_chance=0.7, original do kontex
-            forgetting_chance=0,  # para não haver esquecimento dos especialistas com relação ao que sabem
+            forgetting_chance=0,
             n_patients_zero=1,
             connections=1.5,
             table_info=[("mining", 3, 0.8)],
-            pre_existing_data=pre_existing_data,
+            pre_existing_data=(raw_data, "HotPotQA", theme),
             external_specialist_role=True,
             single_knowledge_employee=True,
-            )
-
+        )
         run, simulated_users, full_knowledge = edd_simulation(config, seed, external_data=True)
-        
+
         domain_name = list(full_knowledge.domains.keys())[0]
-        print("DOMAIN NAME", domain_name)
         domain_description = full_knowledge.domains[domain_name].description
         column_descriptions = full_knowledge.domains[domain_name].facts
+        col_text = "\n".join(f"- {k}: {v}" for k, v in column_descriptions.items())
 
-        theme_dict = dict()
-        theme_dict["full_knowledge"] = full_knowledge
-        theme_dict["run_id"] = run.id
-        theme_dict["users_with_knowledge"] = simulated_users
-        theme_dict["question"] = f"Find the answer to {theme}. Your answer must be succint."
-        theme_dict["expected"] = 10
-
-        print(domain_description)
-        print(column_descriptions)
-        column_keys = column_descriptions.keys()
-        column_descriptions = "\n".join([f"- {col}: {column_descriptions[col]}" for col in column_keys])
-        theme_dict["expected_description"] = domain_name + "\n" + domain_description + "\n" + column_descriptions
-
-        logger.debug(f"Table description: {domain_description}")
-        logger.debug(f"Column descriptions: {column_descriptions}")
-        logger.debug(f"Simulated users: {simulated_users}")
-        dataset.append(theme_dict)
+        dataset.append({
+            "full_knowledge": full_knowledge,
+            "run_id": run.id,
+            "users_with_knowledge": simulated_users,
+            "question": external_question,
+            "expected": 10,
+            "expected_description": expected_answer,
+        })
 
     return dataset
-    # metric to be used to evolve GEPA will be numeric, by comparing the expected final score with the one the critic uses
-    # if the difference between the two decreased from previous gepa iteration, then the prompt is better
-    # TODO: need to include the similarity metric in the final_score calculation, becaususe the critic only 
-    # evaluates how the answer is written and not so much its content
 
-    # TODO: Use reasoning of deepeval metrics to create final_score 
 
-def get_data_from_df(df: pd.DataFrame, n: int = 5) -> FullKnowledge:
-    dataset = list()
-    i=0
-    for row in df.itertuples():
-        table_name = row.table_name
-        table_description = row.description
-        facts = eval(row.facts)
-        domain_name= row.table_theme    
-        domain_description = table_description
-        column_descriptions = facts
-        full_knowledge = FullKnowledge(title=table_name)
-        full_knowledge.add_domain(table_name, table_description)
+def get_data_from_df(df: pd.DataFrame, n: int = 5) -> list[dict]:
+    """
+    Carrega um dataset a partir de um DataFrame com colunas:
+    table_name, description, facts, table_theme.
 
-        for col, desc in facts.items():
-            full_knowledge.add_fact(table_name, col, desc)
+    Returns
+    -------
+    list[dict]
+        Lista de dicts com chaves: full_knowledge, question, expected,
+        expected_description.
+    """
+    dataset: list[dict] = []
 
-        print("DOMAIN NAME", domain_name)
-        print(facts)
-        domain_description = full_knowledge.domains[table_name].description
-        column_descriptions = full_knowledge.domains[table_name].facts
-
-        theme_dict = dict()
-        theme_dict["full_knowledge"] = full_knowledge
-        theme_dict["question"] = f"Describe the dataset related to {domain_name} operations, including key attributes and their significance."
-        theme_dict["expected"] = 10
-
-        column_keys = column_descriptions.keys()
-        column_descriptions = "\n".join([f"- {col}: {column_descriptions[col]}" for col in column_keys])
-        theme_dict["expected_description"] = domain_name + "\n" + domain_description + "\n" + column_descriptions
-
-        dataset.append(theme_dict)
-        i+=1
+    for i, row in enumerate(df.itertuples()):
         if i >= n:
             break
+        facts = eval(row.facts)
+        full_knowledge = FullKnowledge(title=row.table_name)
+        full_knowledge.add_domain(row.table_name, row.description)
+        for col, desc in facts.items():
+            full_knowledge.add_fact(row.table_name, col, desc)
+
+        domain_description = full_knowledge.domains[row.table_name].description
+        column_descriptions = full_knowledge.domains[row.table_name].facts
+        col_text = "\n".join(f"- {k}: {v}" for k, v in column_descriptions.items())
+
+        dataset.append({
+            "full_knowledge": full_knowledge,
+            "question": (
+                f"Describe the dataset related to {row.table_theme} operations, "
+                "including key attributes and their significance."
+            ),
+            "expected": 10,
+            "expected_description": row.table_theme + "\n" + domain_description + "\n" + col_text,
+        })
+
     return dataset
 
 
+# ---------------------------------------------------------------------------
+# Ponto de entrada — workflow de mineração via CSV
+# ---------------------------------------------------------------------------
+
 async def main():
-
-    # 1. Creating Kontex dataset if you want to generate from scratch
-    #dataset = generate_pareto_dataset()
-    # input()
-
+    """
+    Workflow principal: carrega dataset do CSV do Kontex e executa a
+    otimização GEPA sobre o módulo de questionamento (mining workflow).
+    """
     pareto_size = 1
     feedback_size = 1
 
-    # Load CSV and deserialize FullKnowledge objects (loading kontex dataset from csv)
-    csv_path = "../kontex/data/simulated_table_info.csv"
+    csv_path = _parent_dir / "kontex" / "data" / "simulated_table_info.csv"
+    dataset: list[dict] = []
 
-    # Read CSV and deserialize complex objects
-    import csv
-    dataset = []
-
-    with open(csv_path, 'r', encoding='utf-8') as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            # Parse the full_knowledge string into a FullKnowledge object
+    with open(csv_path, encoding="utf-8") as f:
+        for row in csv.DictReader(f):
             full_knowledge_obj = parse_full_knowledge_from_string(
-                row['full_knowledge'],
+                row["full_knowledge"],
                 FullKnowledge=FullKnowledge,
-                DomainKnowledge=DomainKnowledge
+                DomainKnowledge=DomainKnowledge,
             )
+            users_with_knowledge = parse_users_info_to_specialists(row["users_info"])
+            dataset.append({
+                "full_knowledge": full_knowledge_obj,
+                "run_id": UUID(row["run_id"]) if row.get("run_id") else None,
+                "users_with_knowledge": users_with_knowledge,
+                "question": row.get("question"),
+                "expected": int(row.get("expected", 10)),
+                "expected_description": row.get("expected_description"),
+                "users_info": row.get("users_info"),
+            })
 
-            # Parse users_info into Specialist objects
-            users_with_knowledge = parse_users_info_to_specialists(row['users_info'])
+    dataset = dataset[: pareto_size + feedback_size]
 
-            # Create a dictionary with all CSV columns
-            row_dict = {
-                'full_knowledge': full_knowledge_obj,  # Deserialized FullKnowledge object
-                'run_id': UUID(row.get('run_id')) if row.get('run_id') else None,
-                'users_with_knowledge': users_with_knowledge,  # Dict of Specialist objects
-                'question': row.get('question'),
-                'expected': int(row.get('expected', 10)),
-                '   ': row.get('expected_description'),
-                'users_info': row.get('users_info')  # Keep original string for reference
-            }
-
-            dataset.append(row_dict)
-    # print(dataset)
-    # print(dataset[0]["title"])
-    # for data in dataset:
-    #     data["full_knowledge"] = instantiate_full_knowledge(data["full_knowledge"])
-
-
-    # print(dataset.dtype)
-    # dpareto_size = 4
-    # dpareto = dataset[:dpareto_size]
-    # dfeedback = dataset[dpareto_size:]
-    
-    dataset = dataset[:pareto_size + feedback_size]
-    # 2. System with 2 modules: questioner and critique
     system = CompoundAISystem(
         modules={
             "questioning": LanguageModule(
                 id="questioning",
-                prompt="""
-                        You're helping acquire knowledge about a table by questioning specialists.
-                        
-                        Current Table Description:
-                        {table_description}
-                        
-                        Recent Critique:
-                        {critique_response}
-                        
-                        Conversation History with {specialist}:
-                        {chat_history}
-                        
-                        Generate a focused question for {specialist} to improve our table understanding.
-                        Focus on:
-                        - Column meanings and data types
-                        - Example values
-                        - Business context and relationships
-                        
-                        This is very important: DO NOT ASK the specialist for SQL snippets to confirm data. You only need the metadata, not the data itself.
-                        Question:
-                        """,
-                model_weights="gpt-5-mini"
+                prompt=(
+                    "You're helping acquire knowledge about a table by questioning specialists.\n\n"
+                    "Current Table Description:\n{table_description}\n\n"
+                    "Recent Critique:\n{critique_response}\n\n"
+                    "Conversation History with {specialist}:\n{chat_history}\n\n"
+                    "Generate a focused question for {specialist} to improve our table understanding.\n"
+                    "Focus on:\n"
+                    "- Column meanings and data types\n"
+                    "- Example values\n"
+                    "- Business context and relationships\n\n"
+                    "This is very important: DO NOT ASK the specialist for SQL snippets to confirm "
+                    "data. You only need the metadata, not the data itself.\n"
+                    "Question:"
+                ),
+                model_weights="gpt-5-mini",
             )
-            ## TODO: Comentei a mudança no prompt to critico pra ver como se comporta somente com o questionador evoluindo
-            # ,
-
-            # "critique": LanguageModule(
-            #     id="critique",
-            #     prompt="""
-            #             Evaluate the completeness of this table description:
-                        
-            #             {tacit_knowledge}
-                        
-            #             Provide assessment in this format:
-            #             Score: [0-10]
-            #             Reasoning: [why this score]
-            #             Suggestions: [what's missing]
-                        
-            #             To score high (8+), description needs:
-            #             - All column names and meanings
-            #             - Data types for each column
-            #             - Example values where relevant
-            #             - Business context and purpose
-            #             """,
-            #     model_weights="gpt-5-mini"
-            # ),
         },
         control_flow=KontexFlow(),
-        input_schema=IOSchema(
-            fields={"full_knowledge": FullKnowledge},
-            required=["full_knowledge"]
-        ),
-        output_schema=IOSchema(
-            fields={"output": int},
-            required=["output"]
-        ),
-        system_id="kontex"
+        input_schema=IOSchema(fields={"full_knowledge": FullKnowledge}, required=["full_knowledge"]),
+        output_schema=IOSchema(fields={"output": int}, required=["output"]),
+        system_id="kontex",
     )
 
-    config = EnvConfig(env_file = ".env")
-    # Check for API key
-    api_key = config.api_key
-    base_url = config.base_url
-    # print("api key:", api_key)
+    env = EnvConfig(env_file=str(_this_dir / ".env"))
+    api_key = env.api_key
+    base_url = env.base_url
+
     if not api_key:
-        print("Please set OPENAI_API_KEY environment variable")
-        print("   export OPENAI_API_KEY='your-api-key-here'")
+        print("Defina OPENAI_API_KEY no arquivo .env")
         return
-    
-    print("Found API key")
-    # 3. Configuration
+
     config = GEPAConfig(
         inference=InferenceConfig(
             provider="openai",
@@ -789,123 +852,57 @@ async def main():
             temperature=0.1,
             timeout=30,
             base_url=base_url,
-            retry_attempts=3
+            retry_attempts=3,
         ),
         optimization=OptimizationConfig(
             budget=20,
-            pareto_set_size=pareto_size,  # change pareto set size
+            pareto_set_size=pareto_size,
             minibatch_size=feedback_size,
             enable_crossover=True,
             crossover_probability=0.3,
-            mutation_types=["rewrite", "insert"]
+            mutation_types=["rewrite", "insert"],
         ),
-        database=DatabaseConfig(
-            url="sqlite:///gepa_quickstart.db"
-        ),
+        database=DatabaseConfig(url="sqlite:///gepa_mining.db"),
         observability=ObservabilityConfig(
             log_level="INFO",
-            log_file="gepa_quickstart.log",
-            enable_logging=True
-        )
+            log_file="gepa_mining.log",
+            enable_logging=True,
+        ),
     )
 
-    # 4. Create evaluator (need to change metrics for Kontex)
-    evaluator = SimpleFeedbackEvaluator([
-        # AverageDiffScore(name="average_score")
-        GEvalMetric(name="geval_metric")
-    ])
-    
-    # 5. Create inference client
-    print(config.inference.provider)
+    evaluator = SimpleFeedbackEvaluator([GEvalMetric(name="geval_metric")])
     inference_client = InferenceFactory.create_client(config.inference)
+    optimizer = GEPAOptimizer(config=config, evaluator=evaluator, inference_client=inference_client)
 
-    # 6. Create optimizer and run optimization
-    print("🔄 Starting optimization...")
-    print(f"   Budget: {config.optimization.budget} rollouts")
-    print(f"   Dataset size: {len(dataset)} examples")
-    print()
-    
-    optimizer = GEPAOptimizer(
-        config=config,
-        evaluator=evaluator,
-        inference_client=inference_client
-    )
-    
     try:
         result = await optimizer.optimize(system, dataset, max_generations=5)
-        
-        # 7. Display results
-        print("✅ Optimization completed!")
-        print("=" * 50)
-        print(f"🎯 Best score: {result.best_score:.3f}")
-        print(f"🔄 Total rollouts: {result.total_rollouts}")
-        print(f"💰 Total cost: ${result.total_cost:.4f}")
-        print(f"📊 Pareto frontier size: {result.pareto_frontier.size()}")
-        print()
-        
-        # Show the optimized prompt
-        best_questioning_module = result.best_system.modules["questioning"]
-        # best_critique_module = result.best_system.modules["critique"]
-        print("🧠 Optimized questioning prompt:")
-        print("-" * 30)
-        print(best_questioning_module.prompt)
 
-        logger.info(f"Best questioning prompt: \n {best_questioning_module.prompt}")
-        # logger.info(f"Best critique prompt: \n {best_critique_module.prompt}")
-        print("🧠 Optimized critiqu prompt:")
-        print("-" * 30)
-        # print(best_critique_module.prompt)
-        print("-" * 30)
-        print()
-        
-        # # Test the optimized system
-        # print("🧪 Testing optimized system...")
-        # test_examples = [
-        #     "This movie was absolutely incredible!",
-        #     "I'm disappointed with this purchase.",
-        #     "The weather is fine today."
-        # ]
-        
-        # for test_text in test_examples:
-        #     try:
-        #         # Simulate running the optimized system
-        #         input_data = {"text": test_text}
-        #         # In a real scenario, you'd run: result = await result.best_system.execute(input_data, inference_client)
-        #         # For demo, we'll just show the input
-        #         print(f"   Input: '{test_text}'")
-        #         print(f"   System: sentiment_classifier")
-        #         print()
-        #     except Exception as e:
-        #         print(f"   Error testing: {e}")
-        
-        # Show optimization statistics
-        stats = optimizer.get_statistics()
-        print("📊 Optimization Statistics:")
-        print(f"   Generations completed: {stats.get('generations', 0)}")
-        print(f"   Successful mutations: {stats.get('successful_mutations', 0)}")
-        print(f"   Average score improvement: {stats.get('average_improvement', 0):.3f}")
-        
-    except Exception as e:
+        print("✅ Otimização concluída!")
+        print(f"   Melhor score: {result.best_score:.3f}")
+        print(f"   Total rollouts: {result.total_rollouts}")
+        print(f"   Custo total: ${result.total_cost:.4f}")
+
+        best_prompt = result.best_system.modules["questioning"].prompt
+        print("\n🧠 Prompt de questionamento otimizado:")
+        print("-" * 40)
+        print(best_prompt)
+
+        out_dir = _this_dir / "optimized_prompts"
+        out_dir.mkdir(exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_file = out_dir / f"questioning_optimized_{timestamp}.txt"
+        out_file.write_text(best_prompt)
+        print(f"\n💾 Prompt salvo em: {out_file}")
+
+    except Exception:
         import traceback
-        print(f"❌ Optimization failed: {e}")
-        print(f"Traceback: {traceback.format_exc()}")
-        print("This might be due to API limits or network issues.")
-        print("Try again with a smaller budget or check your API key.")
-    
+        print(f"❌ Otimização falhou:\n{traceback.format_exc()}")
     finally:
-        # Clean up
-        await inference_client.close() if hasattr(inference_client, 'close') else None
-        print("\n🎉 Quickstart example completed!")
+        if hasattr(inference_client, "close"):
+            await inference_client.close()
+        print("\n🎉 Processo concluído!")
 
-    # prompts = {
-    #     "questioner_prompt": questioner_prompt,
-    #     "critique_prompt": critique_prompt
-    # }
-
-    # descriptions_dataset, scores_dataset = evaluate_prompt_kontex(prompts, dpareto)
 
 if __name__ == "__main__":
     import asyncio
     asyncio.run(main())
-
-    #TODO: Implementar métrica que avalie a velocidade de convergencia do GEPA ao longo das gerações. Se o prompt diminuir o número de interações para uma boa nota, melhor.
