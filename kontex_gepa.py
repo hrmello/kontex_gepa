@@ -116,12 +116,13 @@ def run_conversation_simulation(
             prompts,
             simulated_users,
             run_id,
+            "entropy"
         )
         initial_user = rng.choice(list(simulated_users.keys()))
         description, final_critique_score = conversational_wrapper.run_conversation(
             table,
             initial_user,
-            min_description_quality=1,
+            min_description_quality=6,
             max_single_conversation=1,
             max_conversation_depth=30  # Limit the conversation depth to avoid long runtimes during testing
         )
@@ -516,7 +517,7 @@ def generate_pareto_dataset(seed = 42):
                 table_info=[(theme, 2, 0.8)],
             )
 
-        run, simulated_users, full_knowledge = edd_simulation(config, seed, theme = theme)
+        run, simulated_users, full_knowledge = edd_simulation(config, seed, theme = theme, rlm_framework = True)
     
         domain_name = list(full_knowledge.domains.keys())[0]
         print("DOMAIN NAME", domain_name)
@@ -588,45 +589,49 @@ def get_data_from_df(df: pd.DataFrame, n: int = 5) -> FullKnowledge:
 
 async def main():
 
-    # 1. Creating Kontex dataset if you want to generate from scratch
-    # dataset = generate_pareto_dataset()
-    # input()
-
+    generate_dataset_in_runtime = False
     pareto_size = 1
     feedback_size = 1
 
-    # Load CSV and deserialize FullKnowledge objects (loading kontex dataset from csv)
-    csv_path = "../kontex/data/simulated_table_info.csv"
+    if generate_dataset_in_runtime:
 
-    # Read CSV and deserialize complex objects
-    import csv
-    dataset = []
+        # 1. Creating Kontex dataset if you want to generate from scratch
+        dataset = generate_pareto_dataset()
+    else:  
 
-    with open(csv_path, 'r', encoding='utf-8') as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            # Parse the full_knowledge string into a FullKnowledge object
-            full_knowledge_obj = parse_full_knowledge_from_string(
-                row['full_knowledge'],
-                FullKnowledge=FullKnowledge,
-                DomainKnowledge=DomainKnowledge
-            )
+            # Load CSV and deserialize FullKnowledge objects (loading kontex dataset from csv)
+            csv_path = "../kontex/data/simulated_table_info.csv"
 
-            # Parse users_info into Specialist objects
-            users_with_knowledge = parse_users_info_to_specialists(row['users_info'])
+            # Read CSV and deserialize complex objects
+            import csv
+            dataset = []
 
-            # Create a dictionary with all CSV columns
-            row_dict = {
-                'full_knowledge': full_knowledge_obj,  # Deserialized FullKnowledge object
-                'run_id': UUID(row.get('run_id')) if row.get('run_id') else None,
-                'users_with_knowledge': users_with_knowledge,  # Dict of Specialist objects
-                'question': row.get('question'),
-                'expected': int(row.get('expected', 10)),
-                'expected_description': row.get('expected_description'),
-                'users_info': row.get('users_info')  # Keep original string for reference
-            }
+            with open(csv_path, 'r', encoding='utf-8') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    # Parse the full_knowledge string into a FullKnowledge object
+                    full_knowledge_obj = parse_full_knowledge_from_string(
+                        row['full_knowledge'],
+                        FullKnowledge=FullKnowledge,
+                        DomainKnowledge=DomainKnowledge
+                    )
 
-            dataset.append(row_dict)
+                    # Parse users_info into Specialist objects
+                    users_with_knowledge = parse_users_info_to_specialists(row['users_info'])
+
+                # Create a dictionary with all CSV columns
+                row_dict = {
+                    'full_knowledge': full_knowledge_obj,  # Deserialized FullKnowledge object
+                    'run_id': UUID(row.get('run_id')) if row.get('run_id') else None,
+                    'users_with_knowledge': users_with_knowledge,  # Dict of Specialist objects
+                    'question': row.get('question'),
+                    'expected': int(row.get('expected', 10)),
+                    'expected_description': row.get('expected_description'),
+                    'users_info': row.get('users_info')  # Keep original string for reference
+                }
+
+                dataset.append(row_dict)
+
     # print(dataset)
     # print(dataset[0]["title"])
     # for data in dataset:
@@ -639,6 +644,7 @@ async def main():
     # dfeedback = dataset[dpareto_size:]
     
     dataset = dataset[:pareto_size + feedback_size]
+
     # 2. System with 2 modules: questioner and critique
     system = CompoundAISystem(
         modules={
