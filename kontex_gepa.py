@@ -599,25 +599,25 @@ async def main():
         dataset = generate_pareto_dataset()
     else:  
 
-            # Load CSV and deserialize FullKnowledge objects (loading kontex dataset from csv)
-            csv_path = "../kontex/data/simulated_table_info.csv"
+        # Load CSV and deserialize FullKnowledge objects (loading kontex dataset from csv)
+        csv_path = "../kontex/data/simulated_table_info.csv"
 
-            # Read CSV and deserialize complex objects
-            import csv
-            dataset = []
+        # Read CSV and deserialize complex objects
+        import csv
+        dataset = []
 
-            with open(csv_path, 'r', encoding='utf-8') as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    # Parse the full_knowledge string into a FullKnowledge object
-                    full_knowledge_obj = parse_full_knowledge_from_string(
-                        row['full_knowledge'],
-                        FullKnowledge=FullKnowledge,
-                        DomainKnowledge=DomainKnowledge
-                    )
+        with open(csv_path, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                # Parse the full_knowledge string into a FullKnowledge object
+                full_knowledge_obj = parse_full_knowledge_from_string(
+                    row['full_knowledge'],
+                    FullKnowledge=FullKnowledge,
+                    DomainKnowledge=DomainKnowledge
+                )
 
-                    # Parse users_info into Specialist objects
-                    users_with_knowledge = parse_users_info_to_specialists(row['users_info'])
+                # Parse users_info into Specialist objects
+                users_with_knowledge = parse_users_info_to_specialists(row['users_info'])
 
                 # Create a dictionary with all CSV columns
                 row_dict = {
